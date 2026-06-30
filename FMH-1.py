@@ -15,6 +15,8 @@ PHONE = 1
 def init_db():
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
+
+    # Создаём таблицу, если её нет
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -22,20 +24,33 @@ def init_db():
             devices INTEGER DEFAULT 0,
             max_devices INTEGER DEFAULT 3,
             bonus_balance INTEGER DEFAULT 0,
-            phone TEXT,
-            first_time INTEGER DEFAULT 1
+            phone TEXT
         )
     ''')
+
+    # Добавляем колонку first_time, если её нет
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN first_time INTEGER DEFAULT 1')
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
+
     conn.commit()
     conn.close()
 
 def get_user(user_id):
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    c.execute('SELECT subscription_end, devices, max_devices, bonus_balance, phone FROM users WHERE user_id = ?', (user_id,))
+    c.execute('SELECT subscription_end, devices, max_devices, bonus_balance, phone, first_time FROM users WHERE user_id = ?', (user_id,))
     result = c.fetchone()
     conn.close()
     return result
+
+def mark_user_as_old(user_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET first_time = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
 
 def create_user(user_id):
     conn = sqlite3.connect('users.db')
@@ -65,32 +80,27 @@ init_db()
 
 # ========== КНОПКИ И МЕНЮ ==========
 
-# Главное меню (кнопки)
 def main_menu():
     keyboard = [
-        [InlineKeyboardButton("📞 Поддержка", callback_data="help")],
-        [InlineKeyboardButton("ℹ️ Информация", callback_data="info")],
-        [InlineKeyboardButton("🤝 Реферальная программа", callback_data="referral")],
+        [InlineKeyboardButton("👤 Личный кабинет", callback_data="profile")],
         [InlineKeyboardButton("💸 Оплата", callback_data="payment")],
         [InlineKeyboardButton("🌐 Подключиться", callback_data="connect")],
-        [InlineKeyboardButton("👤 Личный кабинет", callback_data="profile")],
+        [InlineKeyboardButton("🤝 Реферальная программа", callback_data="referral")],
+        [InlineKeyboardButton("📞 Поддержка", callback_data="help")],
         [InlineKeyboardButton("⌯⌲ Наш канал", callback_data="show_channel")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# Кнопка "Назад"
 def back_button():
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]]
     return InlineKeyboardMarkup(keyboard)
 
-# Приветственное меню для новых пользователей
 def welcome_menu():
     keyboard = [
         [InlineKeyboardButton("🎁 Активировать пробный период", callback_data="activate_trial")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# Меню после активации пробного периода
 def trial_activated_menu():
     keyboard = [
         [InlineKeyboardButton("✅ Активировать", callback_data="activate")]
@@ -99,28 +109,39 @@ def trial_activated_menu():
 
 # ========== МЕНЮ ОПЛАТЫ ==========
 
-def payment_plan_menu():
-    """Меню выбора срока подписки"""
+def payment_tariff_menu():
     keyboard = [
-        [InlineKeyboardButton("1 месяц — 249 ₽", callback_data="pay_plan_1")],
-        [InlineKeyboardButton("3 месяца — 599 ₽", callback_data="pay_plan_3")],
-        [InlineKeyboardButton("6 месяцев — 999 ₽", callback_data="pay_plan_6")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")]
+        [InlineKeyboardButton("📱 Simple — 249 ₽", callback_data="pay_tariff_simple")],
+        [InlineKeyboardButton("🚀 Pro — 499 ₽", callback_data="pay_tariff_pro")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def payment_plan_menu(tariff):
+    prices = {
+        "simple": {"1": 249, "3": 599, "6": 999},
+        "pro": {"1": 499, "3": 999, "6": 1499}
+    }
+    keyboard = [
+        [InlineKeyboardButton(f"1 месяц — {prices[tariff]['1']} ₽", callback_data=f"pay_plan_{tariff}_1")],
+        [InlineKeyboardButton(f"3 месяца — {prices[tariff]['3']} ₽", callback_data=f"pay_plan_{tariff}_3")],
+        [InlineKeyboardButton(f"6 месяцев — {prices[tariff]['6']} ₽", callback_data=f"pay_plan_{tariff}_6")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def payment_method_menu():
-    """Меню выбора способа оплаты"""
     keyboard = [
         [InlineKeyboardButton("🏦 СБП", callback_data="pay_method_sbp")],
         [InlineKeyboardButton("₿ Криптовалюта", callback_data="pay_method_crypto")],
         [InlineKeyboardButton("💳 Банковская карта", callback_data="pay_method_card")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="payment_plans")]
+        [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 def payment_processing_menu(method):
-    """Сообщение после выбора способа оплаты"""
     texts = {
         "sbp": "🏦 **Оплата через СБП**\n\n"
                "Переведите сумму на номер телефона:\n"
@@ -137,11 +158,12 @@ def payment_processing_menu(method):
     }
     keyboard = [
         [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="payment_methods")]
+        [InlineKeyboardButton("🔙 Назад", callback_data="payment_methods_back")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ]
     return texts.get(method, "Способ оплаты не найден"), InlineKeyboardMarkup(keyboard)
 
-# ========== ФУНКЦИИ ОТПРАВКИ СООБЩЕНИЙ ==========
+# ========== ФУНКЦИИ ОТПРАВКИ ==========
 
 async def send_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None):
     image_path = 'FMH-VPN.jpg'
@@ -167,9 +189,7 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Если вы устали от лагающих и не работающих VPN — тогда вы по адресу.\n\n"
         "Чтобы проверить, насколько мы хороши, дарим тебе пробный период на 3 дня."
     )
-
     create_user(update.effective_user.id)
-
     if os.path.exists(image_path):
         with open(image_path, 'rb') as photo:
             await update.message.reply_photo(
@@ -212,7 +232,10 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    subscription_end, devices, max_devices, bonus_balance, phone = user_data
+    # Теперь 6 значений: subscription_end, devices, max_devices, bonus_balance, phone, first_time
+    subscription_end, devices, max_devices, bonus_balance, phone, first_time = user_data
+
+    # ... остальной код без изменений
 
     if subscription_end:
         end_date = datetime.fromisoformat(subscription_end)
@@ -239,31 +262,31 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 **Бонусный счёт:** {bonus_balance} ₽"
         f"📞 **Телефон:** {phone or 'Не указан'}"
     )
-
     await update.effective_chat.send_message(
         text=text,
         parse_mode='Markdown',
         reply_markup=back_button()
     )
 
-# ========== РЕФЕРАЛЬНАЯ ПРОГРАММА С ЗАПРОСОМ ТЕЛЕФОНА ==========
+# ========== РЕФЕРАЛЬНАЯ ПРОГРАММА ==========
 
 async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user(user_id)
 
-    if user_data and user_data[4]:  # phone уже есть
+    if user_data and user_data[4]:
         await update.effective_chat.send_message(
             "👥 Реферальная программа:\n\n"
             "С каждого приобретения или продления подписки приглашенного пользователя Вы получаете 10% на ваш бонусный счет.\n\n"
             "📨 Поделитесь партнёрской ссылкой:\nhttps://t.me/...\n\n"
-            "Например, если вы пригласили 10 пользователей, и каждый из них оформил подписку на 249 рублей, то вы получите 10% от их платежей.\n"
-            "Денежные средства на бонусном счете обновляются каждое первое число следующего месяца.\n\n"
-            "Приглашайте только реальных пользователей, боты будут отфильтрованы.\n"
-            "Вы можете вывести денежные средства с бонусного счета на личную карту или же истратить их в нашем сервисе.",
+            "Например, если вы пригласили 10 пользователей, и каждый из них оформил подписку на 249 рублей, то вы получите 20% от их платежей.\n"
+            "Денежные средства на бонусном счете доступны к выводу каждое первое число следующего месяца.\n\n"
+            "Приглашайте только реальных пользователей, боты будут отфильтрованы.\n\n"
+            "Вы можете вывести денежные средства с бонусного счета на личную карту или же истратить их в нашем сервисе.\n\n"
+            'Вывод на карту доступен от 1000р',
             reply_markup=back_button()
         )
-        return
+        return ConversationHandler.END
 
     await update.effective_chat.send_message(
         "📱 Для участия в реферальной программе укажите ваш номер телефона.\n"
@@ -276,7 +299,6 @@ async def referral_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # Простая валидация номера
     if not phone.startswith('+') or len(phone) < 10:
         await update.message.reply_text(
             "❌ Неверный формат номера. Отправьте номер в формате: +7XXXXXXXXXX"
@@ -305,16 +327,22 @@ async def referral_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ========== ОБРАБОТЧИКИ ==========
+# ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     create_user(user_id)
 
-    if not context.user_data.get('first_time'):
-        context.user_data['first_time'] = True
+    # Получаем данные пользователя из БД
+    user_data = get_user(user_id)
+    first_time = user_data[5] if user_data else 1  # 5-й индекс — first_time
+
+    if first_time == 1:
+        # Первый раз — показываем приветствие
+        mark_user_as_old(user_id)  # помечаем, что уже не новый
         await send_welcome(update, context)
     else:
+        # Старый пользователь — сразу в меню
         await send_main_menu(update, context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,40 +356,56 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_button()
         )
 
-    elif query.data == "info":
-        await update.effective_chat.send_message(
-            "ℹ️ Чтобы узнать информацию посетите наш сайт:\nhttps://example.com",
-            reply_markup=back_button()
-        )
-
-
     elif query.data == "payment":
         await update.effective_chat.send_message(
-            "💸 **Выберите срок подписки:**",
+            "💸 **Выберите тариф:**",
             parse_mode='Markdown',
-            reply_markup=payment_plan_menu()
+            reply_markup=payment_tariff_menu()
         )
 
-    elif query.data == "payment_plans":
+    elif query.data == "payment_methods_back":
+        # Возвращаемся к выбору способов оплаты (сохраняем выбранный тариф)
+        tariff = context.user_data.get('selected_tariff', 'simple')
         await update.effective_chat.send_message(
-            "💸 **Выберите срок подписки:**",
-            parse_mode='Markdown',
-            reply_markup=payment_plan_menu()
-        )
-
-    elif query.data == "payment_methods":
-        await update.effective_chat.send_message(
-            "💳 **Выберите способ оплаты:**",
+            f"💳 **Выберите способ оплаты для тарифа {tariff.capitalize()}:**",
             parse_mode='Markdown',
             reply_markup=payment_method_menu()
         )
 
-    elif query.data.startswith("pay_plan_"):
-        plan = query.data.split("_")[2]
-        plan_names = {"1": "1 месяц (249 ₽)", "3": "3 месяца (599 ₽)", "6": "6 месяцев (999 ₽)"}
-        context.user_data['selected_plan'] = int(plan)
+    elif query.data == "payment_tariff_back":
         await update.effective_chat.send_message(
-            f"✅ Вы выбрали **{plan_names[plan]}**.\n\nТеперь выберите способ оплаты:",
+            "💸 **Выберите тариф:**",
+            parse_mode='Markdown',
+            reply_markup=payment_tariff_menu()
+        )
+
+    elif query.data == "pay_tariff_simple":
+        context.user_data['selected_tariff'] = 'simple'
+        await update.effective_chat.send_message(
+            "📱 **Тариф Simple**\n\nВыберите срок подписки:",
+            parse_mode='Markdown',
+            reply_markup=payment_plan_menu('simple')
+        )
+
+    elif query.data == "pay_tariff_pro":
+        context.user_data['selected_tariff'] = 'pro'
+        await update.effective_chat.send_message(
+            "🚀 **Тариф Pro**\n\nВыберите срок подписки:",
+            parse_mode='Markdown',
+            reply_markup=payment_plan_menu('pro')
+        )
+
+    elif query.data.startswith("pay_plan_"):
+        parts = query.data.split("_")
+        tariff = parts[2]
+        months = parts[3]
+        prices = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 999, "6": 1499}}
+        price = prices[tariff][months]
+        context.user_data['selected_plan'] = int(months)
+
+        await update.effective_chat.send_message(
+            f"✅ Вы выбрали **{tariff.capitalize()}** на {months} месяц(ев).\n"
+            f"💰 Сумма: {price} ₽\n\nВыберите способ оплаты:",
             parse_mode='Markdown',
             reply_markup=payment_method_menu()
         )
@@ -377,14 +421,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "check_payment":
         await update.effective_chat.send_message(
-            "⏳ Проверяем оплату...\n\n"
-            "Если оплата прошла, подписка будет активирована в течение 5 минут.",
+            "⏳ Проверяем оплату...\n\nЕсли оплата прошла, подписка будет активирована в течение 5 минут.",
             reply_markup=back_button()
         )
 
     elif query.data == "connect":
         await update.effective_chat.send_message(
-            "🌐 Подключение недоступно",
+            "🌐 Подключение временно недоступно.\nПожалуйста, оплатите подписку через кнопку «💸 Оплата».",
             reply_markup=back_button()
         )
 
@@ -402,8 +445,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == 'show_channel':
         await update.effective_chat.send_message(
-            'Ссылка на канал:\n'
-            'https://t.me/FMH_VPN'
+            'Ссылка на канал:\nhttps://t.me/FMH_VPN'
         )
 
     elif query.data == "profile":
@@ -427,7 +469,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== ЗАПУСК ==========
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# Регистрируем ConversationHandler для реферальной программы
 conv_handler = ConversationHandler(
     entry_points=[CallbackQueryHandler(referral_start, pattern="^referral")],
     states={
