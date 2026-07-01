@@ -1,3 +1,4 @@
+import logging
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, \
     filters, ConversationHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -6,6 +7,19 @@ import os
 from datetime import datetime, timedelta
 from flask import Flask
 import threading
+
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ (УБРАЛ ДЕБАГ) ==========
+logging.basicConfig(
+    level=logging.INFO,  # ← ИЗМЕНИЛ С DEBUG НА INFO
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Отключаем лишние логи от библиотек
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('httpcore').setLevel(logging.WARNING)
+logging.getLogger('telegram').setLevel(logging.WARNING)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
 # ========== FLASK ДЛЯ RENDER ==========
 flask_app = Flask(__name__)
@@ -19,7 +33,7 @@ def health_check():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, debug=False)  # ← ВЫКЛЮЧИЛ ДЕБАГ
 
 
 threading.Thread(target=run_web, daemon=True).start()
@@ -27,87 +41,122 @@ threading.Thread(target=run_web, daemon=True).start()
 
 # ========== ПОДКЛЮЧЕНИЕ К POSTGRESQL ==========
 def get_db_connection():
-    return psycopg2.connect(
-        host=os.environ.get('DB_HOST', 'localhost'),
-        database=os.environ.get('DB_NAME', 'fmh'),
-        user=os.environ.get('DB_USER', 'postgres'),
-        password=os.environ.get('DB_PASSWORD', '255zhh4j'),
-        port=os.environ.get('DB_PORT', 5432)
-    )
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get('DB_HOST', 'localhost'),
+            database=os.environ.get('DB_NAME', 'fmh'),
+            user=os.environ.get('DB_USER', 'postgres'),
+            password=os.environ.get('DB_PASSWORD', '255zhh4j'),
+            port=os.environ.get('DB_PORT', 5432)
+        )
+        logger.info("✅ Подключение к БД успешно")
+        return conn
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к БД: {e}")
+        raise
 
 
 # ========== БАЗА ДАННЫХ ==========
 def init_db():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            subscription_end TIMESTAMP,
-            devices INTEGER DEFAULT 0,
-            max_devices INTEGER DEFAULT 3,
-            bonus_balance INTEGER DEFAULT 0,
-            phone TEXT,
-            first_time INTEGER DEFAULT 1
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                subscription_end TIMESTAMP,
+                devices INTEGER DEFAULT 0,
+                max_devices INTEGER DEFAULT 3,
+                bonus_balance INTEGER DEFAULT 0,
+                phone TEXT,
+                first_time INTEGER DEFAULT 1
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ Таблица users создана/проверена")
+    except Exception as e:
+        logger.error(f"❌ Ошибка init_db: {e}")
 
 
 def get_user(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute(
-        'SELECT subscription_end, devices, max_devices, bonus_balance, phone, first_time FROM users WHERE user_id = %s',
-        (user_id,))
-    return c.fetchone()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute(
+            'SELECT subscription_end, devices, max_devices, bonus_balance, phone, first_time FROM users WHERE user_id = %s',
+            (user_id,))
+        result = c.fetchone()
+        conn.close()
+        logger.info(f"📊 Получены данные для user_id={user_id}")
+        return result
+    except Exception as e:
+        logger.error(f"❌ Ошибка get_user для {user_id}: {e}")
+        return None
 
 
 def create_user(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO users (user_id, subscription_end, devices, max_devices, bonus_balance, phone, first_time)
-        VALUES (%s, NULL, 0, 3, 0, NULL, 1)
-        ON CONFLICT (user_id) DO NOTHING
-    ''', (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO users (user_id, subscription_end, devices, max_devices, bonus_balance, phone, first_time)
+            VALUES (%s, NULL, 0, 3, 0, NULL, 1)
+            ON CONFLICT (user_id) DO NOTHING
+        ''', (user_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Пользователь {user_id} создан")
+    except Exception as e:
+        logger.error(f"❌ Ошибка create_user для {user_id}: {e}")
 
 
 def mark_user_as_old(user_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('UPDATE users SET first_time = 0 WHERE user_id = %s', (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET first_time = 0 WHERE user_id = %s', (user_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ user_id={user_id} помечен как старый")
+    except Exception as e:
+        logger.error(f"❌ Ошибка mark_user_as_old для {user_id}: {e}")
 
 
 def update_user_phone(user_id, phone):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('UPDATE users SET phone = %s WHERE user_id = %s', (phone, user_id))
-    conn.commit()
-    conn.close()
-    print(f"📝 БД обновлена: user_id={user_id}, phone={phone}")
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET phone = %s WHERE user_id = %s', (phone, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ БД обновлена: user_id={user_id}, phone={phone}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка update_user_phone для {user_id}: {e}")
+        return False
 
 
 def update_user_subscription(user_id, days):
-    conn = get_db_connection()
-    c = conn.cursor()
-    end_date = (datetime.now() + timedelta(days=days)).isoformat()
-    c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s', (end_date, user_id))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        end_date = datetime.now() + timedelta(days=days)
+        c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s', (end_date, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Подписка обновлена для {user_id} на {days} дней до {end_date}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка update_user_subscription: {e}")
+        return False
 
 
 init_db()
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8934659898:AAFjnr0OwI5gV3eV05drid5EnsBrCWGV67c')
 ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
-PHONE = 1
-PAYMENT_PHONE = 2
+PAYMENT_PHONE = 1
 
 
 # ========== КНОПКИ ==========
@@ -142,7 +191,6 @@ def skip_button():
     ])
 
 
-# ========== МЕНЮ ОПЛАТЫ ==========
 def payment_tariff_menu():
     keyboard = [
         [InlineKeyboardButton("📱 Simple — 249 ₽", callback_data="pay_tariff_simple")],
@@ -226,15 +274,31 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     subscription_end, devices, max_devices, bonus_balance, phone, _ = user_data
 
-    if subscription_end and isinstance(subscription_end, str):
-        end_date = datetime.fromisoformat(subscription_end)
-        if end_date > datetime.now():
-            status, days_left = "✅ Активна", (end_date - datetime.now()).days
-            end_text = f"до {end_date.strftime('%d.%m.%Y')} (осталось {days_left} дн.)"
+    # ПРОВЕРЯЕМ ПРАВИЛЬНО
+    if subscription_end:
+        # Если subscription_end - это datetime объект
+        if isinstance(subscription_end, datetime):
+            end_date = subscription_end
+        # Если это строка - конвертируем
+        elif isinstance(subscription_end, str):
+            end_date = datetime.fromisoformat(subscription_end)
         else:
-            status, end_text = "❌ Истекла", f"истекла {end_date.strftime('%d.%m.%Y')}"
+            end_date = None
+
+        if end_date and end_date > datetime.now():
+            days_left = (end_date - datetime.now()).days
+            hours_left = (end_date - datetime.now()).seconds // 3600
+            status = "✅ Активна"
+            if days_left > 0:
+                end_text = f"до {end_date.strftime('%d.%m.%Y')} (осталось {days_left} дн.)"
+            else:
+                end_text = f"до {end_date.strftime('%d.%m.%Y')} (осталось {hours_left} ч.)"
+        else:
+            status = "❌ Истекла"
+            end_text = f"истекла {end_date.strftime('%d.%m.%Y') if end_date else 'давно'}"
     else:
-        status, end_text = "❌ Не активна", "нет активной подписки"
+        status = "❌ Не активна"
+        end_text = "нет активной подписки"
 
     text = (
         f"👤 **Личный кабинет**\n\n"
@@ -250,18 +314,32 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== ОПЛАТА С ЗАПРОСОМ НОМЕРА ==========
+# ========== ОПЛАТА С ЗАПРОСОМ НОМЕРА ==========
 async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("🔴🔴🔴 НАЖАТА КНОПКА ОПЛАТА!")
     query = update.callback_query
     await query.answer()
 
-    user_data = get_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    logger.info(f"🔴 user_id={user_id}")
+
+    user_data = get_user(user_id)
+
     if user_data and user_data[4]:  # номер уже есть
+        # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
+        # await query.message.delete()  ← ЗАКОММЕНТИЛИ
+
         await update.effective_chat.send_message(
             "💸 **Выберите тариф:**",
             parse_mode='Markdown',
             reply_markup=payment_tariff_menu()
         )
         return ConversationHandler.END
+
+    logger.info("❌ Номера нет, запрашиваем ввод")
+
+    # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
+    # await query.message.delete()  ← ЗАКОММЕНТИЛИ
 
     await update.effective_chat.send_message(
         "📱 Для оформления подписки укажите ваш номер телефона.\n"
@@ -273,22 +351,13 @@ async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAYMENT_PHONE
 
 
-async def payment_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    user_id = update.effective_user.id
+async def skip_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("⏭️ ПРОПУСТИТЬ НОМЕР")
+    query = update.callback_query
+    await query.answer()
 
-    print(f"📞 Получен номер: {phone} от user_id: {user_id}")
-
-    if not phone.startswith('+') or len(phone) < 10:
-        await update.message.reply_text(
-            "❌ Неверный формат номера. Отправьте номер в формате: +7XXXXXXXXXX\n"
-            "Или нажмите «Пропустить».",
-            reply_markup=skip_button()
-        )
-        return PAYMENT_PHONE
-
-    update_user_phone(user_id, phone)
-    await update.message.reply_text("✅ Номер сохранён!")
+    # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
+    # await query.message.delete()  ← ЗАКОММЕНТИЛИ
 
     await update.effective_chat.send_message(
         "💸 **Выберите тариф:**",
@@ -298,7 +367,50 @@ async def payment_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def payment_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("🔴🔴🔴🔴🔴 PAYMENT_PHONE ВЫЗВАН! 🔴🔴🔴🔴🔴")
+    phone = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    logger.info(f"📞 Получен номер: {phone} от user_id: {user_id}")
+
+
+    if not phone.startswith('+') or len(phone) < 10:
+        logger.warning(f"❌ Неверный формат номера: {phone}")
+        await update.message.reply_text(
+            "❌ Неверный формат номера. Отправьте номер в формате: +7XXXXXXXXXX\n"
+            "Или нажмите «Пропустить».",
+            reply_markup=skip_button()
+        )
+        return PAYMENT_PHONE
+
+    logger.info(f"💾 Сохраняем номер {phone} для user_id={user_id}")
+    success = update_user_phone(user_id, phone)
+
+    if success:
+        logger.info("✅ Номер успешно сохранен в БД")
+        await update.message.reply_text("✅ Номер сохранён!")
+
+        logger.info("📋 Показываем меню тарифов")
+        await update.effective_chat.send_message(
+            "💸 **Выберите тариф:**",
+            parse_mode='Markdown',
+            reply_markup=payment_tariff_menu()
+        )
+    else:
+        logger.error("❌ Ошибка сохранения номера в БД")
+        await update.message.reply_text(
+            "❌ Ошибка сохранения номера. Попробуйте позже или нажмите «Пропустить».",
+            reply_markup=skip_button()
+        )
+        return PAYMENT_PHONE
+
+    logger.info("🏁 Завершаем диалог")
+    return ConversationHandler.END
+
+
 async def skip_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("⏭️ ПРОПУСТИТЬ НОМЕР")
     query = update.callback_query
     await query.answer()
     await query.message.delete()
@@ -311,7 +423,7 @@ async def skip_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-# ========== РЕФЕРАЛКА (БЕЗ ЗАПРОСА НОМЕРА) ==========
+# ========== РЕФЕРАЛКА ==========
 async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -327,10 +439,9 @@ async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Денежные средства на бонусном счете доступны к выводу каждое первое число следующего месяца.\n\n"
             "Приглашайте только реальных пользователей, боты будут отфильтрованы.\n\n"
             "Вы можете вывести денежные средства с бонусного счета на личную карту или же истратить их в нашем сервисе.\n\n"
-            "Вывод на карту доступен от 1000р",
+            "Вывод на карту доступен от 500р",
             reply_markup=back_button()
         )
-        return ConversationHandler.END
     else:
         await update.effective_chat.send_message(
             "👥 Реферальная программа:\n\n"
@@ -339,7 +450,6 @@ async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "После указания номера вам станут доступны реферальные бонусы.",
             reply_markup=back_button()
         )
-        return ConversationHandler.END
 
 
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
@@ -347,11 +457,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     create_user(user_id)
     user_data = get_user(user_id)
+
+    # ЕСЛИ ПОЛЬЗОВАТЕЛЬ НОВЫЙ (first_time = 1)
     if user_data and user_data[5] == 1:
-        mark_user_as_old(user_id)
-        await send_welcome(update, context)
+        mark_user_as_old(user_id)  # ПОМЕЧАЕМ КАК СТАРОГО
+        await send_welcome(update, context)  # ДАЕМ ПРОБНЫЙ
+
+    # ЕСЛИ УЖЕ БЫЛ (first_time = 0) ИЛИ ПОДПИСКА ЕСТЬ
+    elif user_data and user_data[0] and user_data[0] > datetime.now():
+        await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
+
     else:
-        await send_main_menu(update, context)
+        await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,13 +476,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
 
+    logger.info(f"🔄 Нажата кнопка: {data}")
+
     if data == "help":
         context.user_data['support_mode'] = True
         await update.effective_chat.send_message("📞 Напишите сообщение поддержке, постараемся ответить оперативно",
                                                  reply_markup=back_button())
-
-    elif data == "payment":
-        return await payment_start(update, context)
 
     elif data == "skip_phone":
         return await skip_phone_handler(update, context)
@@ -441,6 +557,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ПОДДЕРЖКА ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"📨 Получено сообщение: {update.message.text}")
+
+    # Проверяем, не находимся ли мы в диалоге оплаты
+    if context.user_data.get('state') == PAYMENT_PHONE:
+        logger.info("🔴 Сообщение перенаправляется в payment_phone")
+        return await payment_phone(update, context)
+
     if context.user_data.get('support_mode'):
         user = update.effective_user
         text = update.message.text
@@ -451,25 +574,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ========== ЗАПУСК ==========
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+def main():
+    logger.info("🚀 Запуск бота...")
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button_handler))
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# ConversationHandler для оплаты с запросом номера
-payment_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(payment_start, pattern="^payment$")],
-    states={
-        PAYMENT_PHONE: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, payment_phone),
-            CallbackQueryHandler(skip_phone_handler, pattern="^skip_phone$"),
-        ],
-    },
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-)
+    app.add_handler(CommandHandler("start", start))
 
-app.add_handler(payment_conv)
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    payment_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(payment_start, pattern="^payment$")],
+        states={
+            PAYMENT_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, payment_phone),
+                CallbackQueryHandler(skip_phone_handler, pattern="^skip_phone$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
+    )
+    app.add_handler(payment_conv)
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-print("Бот запущен...")
-app.run_polling()
+    logger.info("✅ Бот готов! Теперь ТЫКНИ кнопку в телеграме и смотри что в консоли")
+    app.run_polling()
+
+
+if __name__ == '__main__':
+    main()
