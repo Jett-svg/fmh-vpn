@@ -69,7 +69,8 @@ def init_db():
                 max_devices INTEGER DEFAULT 3,
                 bonus_balance INTEGER DEFAULT 0,
                 phone TEXT,
-                first_time INTEGER DEFAULT 1
+                first_time INTEGER DEFAULT 1,
+                referred_by BIGINT DEFAULT NULL
             )
         ''')
         conn.commit()
@@ -157,6 +158,103 @@ init_db()
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '8934659898:AAFjnr0OwI5gV3eV05drid5EnsBrCWGV67c')
 ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
 PAYMENT_PHONE = 1
+
+def add_bonus(user_id, amount):
+    """Начисляет бонусы пользователю"""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s', (amount, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Начислено {amount} бонусов пользователю {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка начисления бонусов: {e}")
+        return False
+
+def get_user_by_id(user_id):
+    """Получает пользователя по ID"""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result
+    except Exception as e:
+        logger.error(f"❌ Ошибка get_user_by_id: {e}")
+        return None
+
+
+def process_payment(user_id, amount):
+    """Обработка оплаты и начисление бонусов рефереру"""
+    try:
+        # Начисляем бонусы рефереру (20%)
+        conn = get_db_connection()
+        c = conn.cursor()
+
+        # Получаем реферера
+        c.execute('SELECT referred_by FROM users WHERE user_id = %s', (user_id,))
+        result = c.fetchone()
+
+        if result and result[0]:
+            referrer_id = result[0]
+            bonus = int(amount * 0.2)  # 20% от платежа
+            c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s', (bonus, referrer_id))
+            logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за платеж {user_id}")
+
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка process_payment: {e}")
+        return False
+
+
+def payment_tariff_menu_with_bonus(user_id):
+    """Меню тарифов с учетом бонусов"""
+    user_data = get_user(user_id)
+    bonus = user_data[3] if user_data else 0
+
+    keyboard = [
+        [InlineKeyboardButton(f"📱 Simple — 249 ₽ (с бонусами: {max(0, 249 - bonus)} ₽)",
+                              callback_data="pay_tariff_simple")],
+        [InlineKeyboardButton("🚀 Pro — 499 ₽", callback_data="pay_tariff_pro")],
+        [InlineKeyboardButton("💸 Использовать бонусы", callback_data="use_bonus")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def use_bonus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик использования бонусов"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    user_data = get_user(user_id)
+    bonus = user_data[3] if user_data else 0
+
+    if bonus >= 249:
+        # Списываем бонусы и активируем подписку
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET bonus_balance = bonus_balance - 249, subscription_end = %s WHERE user_id = %s',
+                  (datetime.now() + timedelta(days=30), user_id))
+        conn.commit()
+        conn.close()
+
+        await update.effective_chat.send_message(
+            f"✅ Подписка активирована за бонусы! Списано 249 бонусов.\n"
+            f"Остаток бонусов: {bonus - 249} ₽",
+            reply_markup=main_menu()
+        )
+    else:
+        await update.effective_chat.send_message(
+            f"❌ Недостаточно бонусов. У вас {bonus} ₽, нужно 249 ₽",
+            reply_markup=back_button()
+        )
 
 
 # ========== КНОПКИ ==========
@@ -428,47 +526,136 @@ async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    user_data = get_user(update.effective_user.id)
+    user_id = update.effective_user.id
+    user_data = get_user(user_id)
 
-    if user_data and user_data[4]:
-        await update.effective_chat.send_message(
-            "👥 Реферальная программа:\n\n"
-            "С каждого приобретения или продления подписки приглашенного пользователя Вы получаете 20% на ваш бонусный счет.\n\n"
-            "📨 Поделитесь партнёрской ссылкой:\nhttps://t.me/...\n\n"
-            "Например, если вы пригласили 10 пользователей, и каждый из них оформил подписку на 249 рублей, то вы получите 20% от их платежей.\n"
-            "Денежные средства на бонусном счете доступны к выводу каждое первое число следующего месяца.\n\n"
-            "Приглашайте только реальных пользователей, боты будут отфильтрованы.\n\n"
-            "Вы можете вывести денежные средства с бонусного счета на личную карту или же истратить их в нашем сервисе.\n\n"
-            "Вывод на карту доступен от 500р",
-            reply_markup=back_button()
+    if user_data and user_data[4]:  # номер есть
+        # Создаем реферальную ссылку
+        bot_username = (await context.bot.get_me()).username
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+        text = (
+            f"👥 **Реферальная программа**\n\n"
+            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**\n\n"  # user_data[3] - bonus_balance
+            f"📨 **Ваша реферальная ссылка:**\n`{ref_link}`\n\n"
+            f"🔥 **Как это работает:**\n"
+            f"• Приглашайте друзей по вашей ссылке\n"
+            f"• Когда друг оформит подписку, вы получите **20%** от его платежа\n"
+            f"• Бонусы можно тратить на подписку или выводить\n\n"
+            f"💸 **Вывод бонусов:**\n"
+            f"• Минимальная сумма вывода: **500 ₽**\n"
+            f"• Вывод осуществляется каждый месяц\n\n"
+            f"📊 **Статистика:**\n"
+            f"• Приглашено: {get_referral_count(user_id)} человек\n"
+            f"• Заработано: {get_total_earnings(user_id)} ₽"
         )
+        await update.effective_chat.send_message(text, parse_mode='Markdown', reply_markup=back_button())
     else:
         await update.effective_chat.send_message(
-            "👥 Реферальная программа:\n\n"
+            "👥 **Реферальная программа**\n\n"
             "Для участия в реферальной программе необходимо указать номер телефона.\n"
             "Вы можете сделать это при оформлении подписки через кнопку «💸 Оплата».\n\n"
             "После указания номера вам станут доступны реферальные бонусы.",
+            parse_mode='Markdown',
             reply_markup=back_button()
         )
+
+
+def get_referral_count(user_id):
+    """Считает сколько людей пригласил пользователь"""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT COUNT(*) FROM users WHERE referred_by = %s', (user_id,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        logger.error(f"❌ Ошибка get_referral_count: {e}")
+        return 0
+
+
+def get_total_earnings(user_id):
+    """Считает сколько заработал пользователь (нужно добавить таблицу транзакций)"""
+    # Пока просто возвращаем бонусный баланс
+    user = get_user(user_id)
+    return user[3] if user else 0
 
 
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    create_user(user_id)
-    user_data = get_user(user_id)
 
-    # ЕСЛИ ПОЛЬЗОВАТЕЛЬ НОВЫЙ (first_time = 1)
-    if user_data and user_data[5] == 1:
-        mark_user_as_old(user_id)  # ПОМЕЧАЕМ КАК СТАРОГО
-        await send_welcome(update, context)  # ДАЕМ ПРОБНЫЙ
+    # Проверяем, есть ли реферальный параметр
+    referrer_id = None
+    if context.args:
+        try:
+            # Формат: /start ref_123456789
+            if context.args[0].startswith('ref_'):
+                referrer_id = int(context.args[0].split('_')[1])
+                logger.info(f"🔗 Реферальная ссылка от {referrer_id} для {user_id}")
+        except:
+            pass
 
-    # ЕСЛИ УЖЕ БЫЛ (first_time = 0) ИЛИ ПОДПИСКА ЕСТЬ
-    elif user_data and user_data[0] and user_data[0] > datetime.now():
-        await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
+    # Проверяем, существует ли пользователь в БД
+    existing_user = get_user(user_id)
+
+    # ЕСЛИ ПОЛЬЗОВАТЕЛЯ НЕТ В БД - создаем и проверяем рефералку
+    if existing_user is None:
+        # 1. Создаем пользователя
+        create_user(user_id)
+
+        # 2. Проверяем реферера
+        if referrer_id and referrer_id != user_id:
+            try:
+                conn = get_db_connection()
+                c = conn.cursor()
+
+                # Проверяем, существует ли реферер в БД и есть ли у него номер
+                c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
+                referrer_data = c.fetchone()
+
+                if referrer_data:
+                    referrer_phone = referrer_data[1]
+
+                    # Проверяем, есть ли у реферера номер телефона
+                    if referrer_phone and referrer_phone.strip():
+                        # Все проверки пройдены - сохраняем реферера
+                        c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s',
+                                  (referrer_id, user_id))
+                        conn.commit()
+                        logger.info(f"✅ Пользователь {user_id} приглашен {referrer_id}")
+                    else:
+                        logger.warning(f"⚠️ Реферер {referrer_id} не указал номер телефона")
+                else:
+                    logger.warning(f"⚠️ Реферер {referrer_id} не найден в БД")
+
+                conn.close()
+            except Exception as e:
+                logger.error(f"❌ Ошибка сохранения реферера: {e}")
+
+        # Пользователь новый - показываем приветствие
+        user_data = get_user(user_id)
+        if user_data and user_data[5] == 1:
+            mark_user_as_old(user_id)
+            await send_welcome(update, context)
 
     else:
-        await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
+        # ПОЛЬЗОВАТЕЛЬ УЖЕ СУЩЕСТВУЕТ
+        logger.info(f"ℹ️ Пользователь {user_id} уже существует")
+
+        # Если пользователь уже есть, но first_time = 1 (почему-то не помечен старым)
+        if existing_user[5] == 1:
+            mark_user_as_old(user_id)
+            await send_welcome(update, context)
+
+        # ЕСЛИ ПОДПИСКА АКТИВНА
+        elif existing_user[0] and existing_user[0] > datetime.now():
+            await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
+
+        # ИНАЧЕ - ГЛАВНОЕ МЕНЮ
+        else:
+            await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
