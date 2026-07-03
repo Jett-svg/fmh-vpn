@@ -7,15 +7,19 @@ import os
 from datetime import datetime, timedelta
 from flask import Flask
 import threading
+from yookassa import Configuration, Payment
+import uuid
+from dotenv import load_dotenv
 
-# ========== НАСТРОЙКА ЛОГИРОВАНИЯ (УБРАЛ ДЕБАГ) ==========
+load_dotenv()
+
+# ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
-    level=logging.INFO,  # ← ИЗМЕНИЛ С DEBUG НА INFO
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Отключаем лишние логи от библиотек
 logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 logging.getLogger('telegram').setLevel(logging.WARNING)
@@ -33,7 +37,7 @@ def health_check():
 
 def run_web():
     port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port, debug=False)  # ← ВЫКЛЮЧИЛ ДЕБАГ
+    flask_app.run(host="0.0.0.0", port=port, debug=False)
 
 
 threading.Thread(target=run_web, daemon=True).start()
@@ -43,11 +47,12 @@ threading.Thread(target=run_web, daemon=True).start()
 def get_db_connection():
     try:
         conn = psycopg2.connect(
-            host=os.environ.get('DB_HOST', 'localhost'),
-            database=os.environ.get('DB_NAME', 'fmh'),
-            user=os.environ.get('DB_USER', 'postgres'),
-            password=os.environ.get('DB_PASSWORD', '255zhh4j'),
-            port=os.environ.get('DB_PORT', 5432)
+            host=os.environ.get('DB_HOST'),
+            database=os.environ.get('DB_NAME'),
+            user=os.environ.get('DB_USER'),
+            password=os.environ.get('DB_PASSWORD'),
+            port=os.environ.get('DB_PORT'),
+            sslmode = 'require'
         )
         logger.info("✅ Подключение к БД успешно")
         return conn
@@ -155,53 +160,88 @@ def update_user_subscription(user_id, days):
 
 init_db()
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '8934659898:AAFjnr0OwI5gV3eV05drid5EnsBrCWGV67c')
-ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID'))
 PAYMENT_PHONE = 1
 
-def add_bonus(user_id, amount):
-    """Начисляет бонусы пользователю"""
-    try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s', (amount, user_id))
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ Начислено {amount} бонусов пользователю {user_id}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Ошибка начисления бонусов: {e}")
-        return False
+# ========== НАСТРОЙКА ЮKASSA ==========
+YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID')
+YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY')
+YOOKASSA_TEST_MODE = True
 
-def get_user_by_id(user_id):
-    """Получает пользователя по ID"""
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_SECRET_KEY
+
+
+def create_yookassa_payment(user_id, amount, description="Оплата подписки VPN", payment_type="bank_card"):
     try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result
+        idempotence_key = str(uuid.uuid4())
+
+        payment_data = {
+            "amount": {
+                "value": str(amount),
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": "https://t.me/fmh_vpn_bot"
+            },
+            "description": description,
+            "metadata": {
+                "user_id": str(user_id)
+            },
+            "capture": True  # ← ДОБАВЬ ЭТУ СТРОКУ! Это включает мгновенное списание
+        }
+
+        # Если СБП - добавляем payment_method_data
+        if payment_type == "sbp":
+            payment_data["payment_method_data"] = {
+                "type": "sbp"
+            }
+
+        if YOOKASSA_TEST_MODE:
+            payment_data["test"] = True
+
+        payment = Payment.create(payment_data, idempotence_key)
+        logger.info(f"💰 Платеж создан: {payment.id} для user_id={user_id}")
+
+        return {
+            'payment_id': payment.id,
+            'confirmation_url': payment.confirmation.confirmation_url,
+            'status': payment.status
+        }
     except Exception as e:
-        logger.error(f"❌ Ошибка get_user_by_id: {e}")
+        logger.error(f"❌ Ошибка создания платежа: {e}")
+        return None
+
+
+def check_payment_status(payment_id):
+    try:
+        payment = Payment.find_one(payment_id)
+        return {
+            'status': payment.status,
+            'paid': payment.paid,
+            'amount': payment.amount.value
+        }
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки платежа: {e}")
         return None
 
 
 def process_payment(user_id, amount):
-    """Обработка оплаты и начисление бонусов рефереру"""
+    """Обработка оплаты и начисление бонусов рефереру (20%)"""
     try:
-        # Начисляем бонусы рефереру (20%)
         conn = get_db_connection()
         c = conn.cursor()
 
-        # Получаем реферера
         c.execute('SELECT referred_by FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
 
         if result and result[0]:
             referrer_id = result[0]
-            bonus = int(amount * 0.2)  # 20% от платежа
-            c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s', (bonus, referrer_id))
+            bonus = int(amount * 0.2)
+            c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
+                      (bonus, referrer_id))
             logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за платеж {user_id}")
 
         conn.commit()
@@ -212,49 +252,16 @@ def process_payment(user_id, amount):
         return False
 
 
-def payment_tariff_menu_with_bonus(user_id):
-    """Меню тарифов с учетом бонусов"""
-    user_data = get_user(user_id)
-    bonus = user_data[3] if user_data else 0
-
-    keyboard = [
-        [InlineKeyboardButton(f"📱 Simple — 249 ₽ (с бонусами: {max(0, 249 - bonus)} ₽)",
-                              callback_data="pay_tariff_simple")],
-        [InlineKeyboardButton("🚀 Pro — 499 ₽", callback_data="pay_tariff_pro")],
-        [InlineKeyboardButton("💸 Использовать бонусы", callback_data="use_bonus")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-async def use_bonus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик использования бонусов"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = update.effective_user.id
-    user_data = get_user(user_id)
-    bonus = user_data[3] if user_data else 0
-
-    if bonus >= 249:
-        # Списываем бонусы и активируем подписку
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('UPDATE users SET bonus_balance = bonus_balance - 249, subscription_end = %s WHERE user_id = %s',
-                  (datetime.now() + timedelta(days=30), user_id))
-        conn.commit()
-        conn.close()
-
-        await update.effective_chat.send_message(
-            f"✅ Подписка активирована за бонусы! Списано 249 бонусов.\n"
-            f"Остаток бонусов: {bonus - 249} ₽",
-            reply_markup=main_menu()
-        )
-    else:
-        await update.effective_chat.send_message(
-            f"❌ Недостаточно бонусов. У вас {bonus} ₽, нужно 249 ₽",
-            reply_markup=back_button()
-        )
+def process_successful_payment(user_id, payment_id, amount):
+    """Обработка успешного платежа - активация подписки + бонусы рефереру"""
+    try:
+        update_user_subscription(user_id, 30)
+        process_payment(user_id, amount)
+        logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки платежа: {e}")
+        return False
 
 
 # ========== КНОПКИ ==========
@@ -289,50 +296,51 @@ def skip_button():
     ])
 
 
-def payment_tariff_menu():
+def payment_tariff_menu_with_bonus(user_id, selected_tariff=None, selected_plan=None):
+    """Меню тарифов с учетом бонусов и частичной оплаты"""
+    user_data = get_user(user_id)
+    bonus = user_data[3] if user_data else 0
+
+    prices = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}
+
+    # Если тариф и план выбраны - показываем варианты оплаты
+    if selected_tariff and selected_plan:
+        price = prices[selected_tariff][str(selected_plan)]
+
+        keyboard = []
+
+        # Кнопка 1: Оплатить ВСЕ бонусами (если хватает)
+        if bonus >= price:
+            keyboard.append([InlineKeyboardButton(
+                f"💰 Оплатить ВСЕ бонусами ({price} ₽)",
+                callback_data=f"bonus_all_{selected_tariff}_{selected_plan}"
+            )])
+
+        # Кнопка 2: Частичная оплата (ввод суммы) - ВСЕГДА ЕСТЬ!
+        if bonus > 0:
+            keyboard.append([InlineKeyboardButton(
+                f"🔄 Частично бонусами (есть {bonus} ₽)",
+                callback_data=f"bonus_partial_input_{selected_tariff}_{selected_plan}"
+            )])
+
+        # Кнопка 3: Полностью деньгами
+        keyboard.append([InlineKeyboardButton(
+            f"💳 Полностью деньгами — {price} ₽",
+            callback_data=f"pay_full_{selected_tariff}_{selected_plan}"
+        )])
+
+        keyboard.append([InlineKeyboardButton("🔙 К выбору срока", callback_data=f"back_to_plan_{selected_tariff}")])
+        keyboard.append([InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")])
+
+        return InlineKeyboardMarkup(keyboard)
+
+    # Если тариф не выбран - показываем выбор тарифа
     keyboard = [
-        [InlineKeyboardButton("📱 Simple — 249 ₽", callback_data="pay_tariff_simple")],
-        [InlineKeyboardButton("🚀 Pro — 499 ₽", callback_data="pay_tariff_pro")],
+        [InlineKeyboardButton(f"📱 Simple — от 249 ₽ (бонусов: {bonus} ₽)", callback_data="tariff_select_simple")],
+        [InlineKeyboardButton(f"🚀 Pro — от 499 ₽ (бонусов: {bonus} ₽)", callback_data="tariff_select_pro")],
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
-
-
-def payment_plan_menu(tariff):
-    prices = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}
-    keyboard = [
-        [InlineKeyboardButton(f"1 месяц — {prices[tariff]['1']} ₽", callback_data=f"pay_plan_{tariff}_1")],
-        [InlineKeyboardButton(f"3 месяца — {prices[tariff]['3']} ₽", callback_data=f"pay_plan_{tariff}_3")],
-        [InlineKeyboardButton(f"6 месяцев — {prices[tariff]['6']} ₽", callback_data=f"pay_plan_{tariff}_6")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def payment_method_menu():
-    keyboard = [
-        [InlineKeyboardButton("🏦 СБП", callback_data="pay_method_sbp")],
-        [InlineKeyboardButton("₿ Криптовалюта", callback_data="pay_method_crypto")],
-        [InlineKeyboardButton("💳 Банковская карта", callback_data="pay_method_card")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
-def payment_processing_menu(method):
-    texts = {
-        "sbp": "🏦 **Оплата через СБП**\n\nПереведите сумму на номер телефона:\n`+7 999 123-45-67`\n\nПосле оплаты нажмите кнопку «Проверить оплату».",
-        "crypto": "₿ **Оплата криптовалютой**\n\nОтправьте USDT (TRC20) на адрес:\n`TXYZ...`\n\nПосле оплаты нажмите кнопку «Проверить оплату».",
-        "card": "💳 **Оплата банковской картой**\n\nПерейдите по ссылке для оплаты:\n🔗 [Оплатить картой](https://example.com/pay)\n\nПосле оплаты нажмите кнопку «Проверить оплату»."
-    }
-    keyboard = [
-        [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
-        [InlineKeyboardButton("🔙 Назад", callback_data="payment_methods_back")],
-        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
-    ]
-    return texts.get(method, "Способ оплаты не найден"), InlineKeyboardMarkup(keyboard)
 
 
 # ========== ОТПРАВКА СООБЩЕНИЙ ==========
@@ -372,12 +380,9 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     subscription_end, devices, max_devices, bonus_balance, phone, _ = user_data
 
-    # ПРОВЕРЯЕМ ПРАВИЛЬНО
     if subscription_end:
-        # Если subscription_end - это datetime объект
         if isinstance(subscription_end, datetime):
             end_date = subscription_end
-        # Если это строка - конвертируем
         elif isinstance(subscription_end, str):
             end_date = datetime.fromisoformat(subscription_end)
         else:
@@ -411,8 +416,7 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(text=text, parse_mode='Markdown', reply_markup=back_button())
 
 
-# ========== ОПЛАТА С ЗАПРОСОМ НОМЕРА ==========
-# ========== ОПЛАТА С ЗАПРОСОМ НОМЕРА ==========
+# ========== ОПЛАТА ==========
 async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("🔴🔴🔴 НАЖАТА КНОПКА ОПЛАТА!")
     query = update.callback_query
@@ -423,22 +427,16 @@ async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data = get_user(user_id)
 
-    if user_data and user_data[4]:  # номер уже есть
-        # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
-        # await query.message.delete()  ← ЗАКОММЕНТИЛИ
-
+    if user_data and user_data[4]:
         await update.effective_chat.send_message(
-            "💸 **Выберите тариф:**",
+            "💸 **Выберите тариф:**\n\n"
+            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**",
             parse_mode='Markdown',
-            reply_markup=payment_tariff_menu()
+            reply_markup=payment_tariff_menu_with_bonus(user_id)
         )
         return ConversationHandler.END
 
     logger.info("❌ Номера нет, запрашиваем ввод")
-
-    # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
-    # await query.message.delete()  ← ЗАКОММЕНТИЛИ
-
     await update.effective_chat.send_message(
         "📱 Для оформления подписки укажите ваш номер телефона.\n"
         "Это необязательно, но поможет нам связаться с вами.\n\n"
@@ -449,29 +447,12 @@ async def payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAYMENT_PHONE
 
 
-async def skip_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("⏭️ ПРОПУСТИТЬ НОМЕР")
-    query = update.callback_query
-    await query.answer()
-
-    # УБИРАЕМ УДАЛЕНИЕ СООБЩЕНИЯ
-    # await query.message.delete()  ← ЗАКОММЕНТИЛИ
-
-    await update.effective_chat.send_message(
-        "💸 **Выберите тариф:**",
-        parse_mode='Markdown',
-        reply_markup=payment_tariff_menu()
-    )
-    return ConversationHandler.END
-
-
 async def payment_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("🔴🔴🔴🔴🔴 PAYMENT_PHONE ВЫЗВАН! 🔴🔴🔴🔴🔴")
+    logger.info("🔴🔴🔴🔴🔴 PAYMENT_PHONE ВЫЗВАН!")
     phone = update.message.text.strip()
     user_id = update.effective_user.id
 
     logger.info(f"📞 Получен номер: {phone} от user_id: {user_id}")
-
 
     if not phone.startswith('+') or len(phone) < 10:
         logger.warning(f"❌ Неверный формат номера: {phone}")
@@ -488,12 +469,13 @@ async def payment_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success:
         logger.info("✅ Номер успешно сохранен в БД")
         await update.message.reply_text("✅ Номер сохранён!")
-
         logger.info("📋 Показываем меню тарифов")
+        user_data = get_user(user_id)
         await update.effective_chat.send_message(
-            "💸 **Выберите тариф:**",
+            "💸 **Выберите тариф:**\n\n"
+            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**",
             parse_mode='Markdown',
-            reply_markup=payment_tariff_menu()
+            reply_markup=payment_tariff_menu_with_bonus(user_id)
         )
     else:
         logger.error("❌ Ошибка сохранения номера в БД")
@@ -513,10 +495,13 @@ async def skip_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     await query.message.delete()
 
+    user_id = update.effective_user.id
+    user_data = get_user(user_id)
     await update.effective_chat.send_message(
-        "💸 **Выберите тариф:**",
+        "💸 **Выберите тариф:**\n\n"
+        f"💰 Ваш бонусный счет: **{user_data[3]} ₽**",
         parse_mode='Markdown',
-        reply_markup=payment_tariff_menu()
+        reply_markup=payment_tariff_menu_with_bonus(user_id)
     )
     return ConversationHandler.END
 
@@ -529,14 +514,13 @@ async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_data = get_user(user_id)
 
-    if user_data and user_data[4]:  # номер есть
-        # Создаем реферальную ссылку
+    if user_data and user_data[4]:
         bot_username = (await context.bot.get_me()).username
         ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
 
         text = (
             f"👥 **Реферальная программа**\n\n"
-            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**\n\n"  # user_data[3] - bonus_balance
+            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**\n\n"
             f"📨 **Ваша реферальная ссылка:**\n`{ref_link}`\n\n"
             f"🔥 **Как это работает:**\n"
             f"• Приглашайте друзей по вашей ссылке\n"
@@ -562,7 +546,6 @@ async def referral_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def get_referral_count(user_id):
-    """Считает сколько людей пригласил пользователь"""
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -576,8 +559,6 @@ def get_referral_count(user_id):
 
 
 def get_total_earnings(user_id):
-    """Считает сколько заработал пользователь (нужно добавить таблицу транзакций)"""
-    # Пока просто возвращаем бонусный баланс
     user = get_user(user_id)
     return user[3] if user else 0
 
@@ -586,76 +567,51 @@ def get_total_earnings(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
-    # Проверяем, есть ли реферальный параметр
     referrer_id = None
     if context.args:
         try:
-            # Формат: /start ref_123456789
             if context.args[0].startswith('ref_'):
                 referrer_id = int(context.args[0].split('_')[1])
                 logger.info(f"🔗 Реферальная ссылка от {referrer_id} для {user_id}")
         except:
             pass
 
-    # Проверяем, существует ли пользователь в БД
     existing_user = get_user(user_id)
 
-    # ЕСЛИ ПОЛЬЗОВАТЕЛЯ НЕТ В БД - создаем и проверяем рефералку
     if existing_user is None:
-        # 1. Создаем пользователя
         create_user(user_id)
 
-        # 2. Проверяем реферера
         if referrer_id and referrer_id != user_id:
             try:
                 conn = get_db_connection()
                 c = conn.cursor()
-
-                # Проверяем, существует ли реферер в БД и есть ли у него номер
                 c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
                 referrer_data = c.fetchone()
 
-                if referrer_data:
-                    referrer_phone = referrer_data[1]
-
-                    # Проверяем, есть ли у реферера номер телефона
-                    if referrer_phone and referrer_phone.strip():
-                        # Все проверки пройдены - сохраняем реферера
-                        c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s',
-                                  (referrer_id, user_id))
-                        conn.commit()
-                        logger.info(f"✅ Пользователь {user_id} приглашен {referrer_id}")
-                    else:
-                        logger.warning(f"⚠️ Реферер {referrer_id} не указал номер телефона")
-                else:
-                    logger.warning(f"⚠️ Реферер {referrer_id} не найден в БД")
-
+                if referrer_data and referrer_data[1] and referrer_data[1].strip():
+                    c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s',
+                              (referrer_id, user_id))
+                    conn.commit()
+                    logger.info(f"✅ Пользователь {user_id} приглашен {referrer_id}")
                 conn.close()
             except Exception as e:
                 logger.error(f"❌ Ошибка сохранения реферера: {e}")
 
-        # Пользователь новый - показываем приветствие
         user_data = get_user(user_id)
         if user_data and user_data[5] == 1:
             mark_user_as_old(user_id)
             await send_welcome(update, context)
 
     else:
-        # ПОЛЬЗОВАТЕЛЬ УЖЕ СУЩЕСТВУЕТ
         logger.info(f"ℹ️ Пользователь {user_id} уже существует")
 
-        # Если пользователь уже есть, но first_time = 1 (почему-то не помечен старым)
         if existing_user[5] == 1:
             mark_user_as_old(user_id)
             await send_welcome(update, context)
-
-        # ЕСЛИ ПОДПИСКА АКТИВНА
         elif existing_user[0] and existing_user[0] > datetime.now():
-            await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
-
-        # ИНАЧЕ - ГЛАВНОЕ МЕНЮ
+            await send_main_menu(update, context)
         else:
-            await send_main_menu(update, context)  # ПРОСТО ГЛАВНОЕ МЕНЮ
+            await send_main_menu(update, context)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -665,79 +621,419 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     logger.info(f"🔄 Нажата кнопка: {data}")
 
+    # ===== ПОДДЕРЖКА =====
     if data == "help":
         context.user_data['support_mode'] = True
         await update.effective_chat.send_message("📞 Напишите сообщение поддержке, постараемся ответить оперативно",
                                                  reply_markup=back_button())
 
+    # ===== ПРОПУСТИТЬ НОМЕР =====
     elif data == "skip_phone":
         return await skip_phone_handler(update, context)
 
+    # ===== НАЗАД К ВЫБОРУ ТАРИФА =====
     elif data == "payment_tariff_back":
-        await update.effective_chat.send_message("💸 **Выберите тариф:**", parse_mode='Markdown',
-                                                 reply_markup=payment_tariff_menu())
-
-    elif data == "payment_methods_back":
-        tariff = context.user_data.get('selected_tariff', 'simple')
-        await update.effective_chat.send_message(f"💳 **Выберите способ оплаты для тарифа {tariff.capitalize()}:**",
-                                                 parse_mode='Markdown', reply_markup=payment_method_menu())
-
-    elif data == "pay_tariff_simple":
-        context.user_data['selected_tariff'] = 'simple'
-        await update.effective_chat.send_message("📱 **Тариф Simple**\n\nВыберите срок подписки:", parse_mode='Markdown',
-                                                 reply_markup=payment_plan_menu('simple'))
-
-    elif data == "pay_tariff_pro":
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
         await update.effective_chat.send_message(
-            "🚀 **Тариф Pro**\n\n"
-            "К сожалению, этот тариф пока находится в разработке.\n"
-            "Следите за обновлениями!",
+            "💸 **Выберите тариф:**\n\n"
+            f"💰 Ваш бонусный счет: **{user_data[3]} ₽**",
+            parse_mode='Markdown',
+            reply_markup=payment_tariff_menu_with_bonus(user_id)
+        )
+
+    # ===== ВЫБОР ТАРИФА =====
+    elif data.startswith("tariff_select_"):
+        tariff = data.split("_")[2]
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+        bonus = user_data[3] if user_data else 0
+
+        context.user_data['selected_tariff'] = tariff
+
+        prices = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}
+
+        keyboard = [
+            [InlineKeyboardButton(
+                f"1 месяц — {prices[tariff]['1']} ₽ (бонусов: {min(bonus, prices[tariff]['1'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_1"
+            )],
+            [InlineKeyboardButton(
+                f"3 месяца — {prices[tariff]['3']} ₽ (бонусов: {min(bonus, prices[tariff]['3'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_3"
+            )],
+            [InlineKeyboardButton(
+                f"6 месяцев — {prices[tariff]['6']} ₽ (бонусов: {min(bonus, prices[tariff]['6'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_6"
+            )],
+            [InlineKeyboardButton("🔙 Выбор тарифа", callback_data="payment_tariff_back")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+
+        await update.effective_chat.send_message(
+            f"📱 **Тариф {tariff.capitalize()}**\n\n"
+            f"💰 Ваш бонусный счет: **{bonus} ₽**\n\n"
+            f"Выберите срок подписки:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ===== ВЫБОР ПЛАНА (СРОКА) =====
+    elif data.startswith("plan_with_bonus_"):
+        parts = data.split("_")
+        tariff, months = parts[3], parts[4]
+        months = int(months)
+
+        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+        bonus = user_data[3] if user_data else 0
+
+        context.user_data['selected_tariff'] = tariff
+        context.user_data['selected_plan'] = months
+        context.user_data['payment_amount'] = price
+
+        # ===== МЕНЮ СПОСОБОВ ОПЛАТЫ (ДОБАВИЛИ СБП) =====
+        keyboard = [
+            [InlineKeyboardButton(
+                f"💰 Оплатить ВСЕ бонусами ({min(bonus, price)} ₽)" if bonus >= price else f"💰 Не хватает бонусов ({bonus} из {price} ₽)",
+                callback_data=f"bonus_all_{tariff}_{months}" if bonus >= price else "no_bonus"
+            )],
+            [InlineKeyboardButton(
+                f"🔄 Частично бонусами (есть {bonus} ₽)",
+                callback_data=f"bonus_partial_input_{tariff}_{months}"
+            )] if bonus > 0 else [],
+            [InlineKeyboardButton(
+                f"💳 Банковская карта — {price} ₽",
+                callback_data=f"pay_full_card_{tariff}_{months}"
+            )],
+            [InlineKeyboardButton(
+                f"🏦 СБП — {price} ₽",
+                callback_data=f"pay_full_sbp_{tariff}_{months}"
+            )],
+            [InlineKeyboardButton("🔙 К выбору срока", callback_data=f"back_to_plan_{tariff}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+        # Убираем пустые кнопки
+        keyboard = [k for k in keyboard if k]
+
+        await update.effective_chat.send_message(
+            f"✅ **Вы выбрали {tariff.capitalize()} на {months} месяц(ев)**\n\n"
+            f"💰 Стоимость: **{price} ₽**\n"
+            f"💎 Ваши бонусы: **{bonus} ₽**\n\n"
+            f"💡 **Выберите способ оплаты:**",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    # ===== ОПЛАТА ВСЕМИ БОНУСАМИ =====
+    elif data.startswith("bonus_all_"):
+        parts = data.split("_")
+        tariff, months = parts[2], parts[3]
+        months = int(months)
+
+        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+        bonus = user_data[3] if user_data else 0
+
+        if bonus >= price:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('''
+                UPDATE users 
+                SET bonus_balance = bonus_balance - %s, 
+                    subscription_end = %s 
+                WHERE user_id = %s
+            ''', (price, datetime.now() + timedelta(days=30 * months), user_id))
+            conn.commit()
+            conn.close()
+
+            await update.effective_chat.send_message(
+                f"✅ **Подписка активирована за бонусы!** 🎉\n\n"
+                f"📱 Тариф: {tariff.capitalize()}\n"
+                f"📆 Период: {months} месяц(ев)\n"
+                f"💰 Списано бонусов: **{price} ₽**\n"
+                f"📊 Остаток бонусов: **{bonus - price} ₽**",
+                parse_mode='Markdown',
+                reply_markup=main_menu()
+            )
+        else:
+            await update.effective_chat.send_message(
+                f"❌ **Недостаточно бонусов!**\n\n"
+                f"💎 У вас: **{bonus}** бонусов\n"
+                f"💸 Нужно: **{price}** бонусов",
+                parse_mode='Markdown',
+                reply_markup=back_button()
+            )
+
+    # ===== ЧАСТИЧНАЯ ОПЛАТА (ВВОД СУММЫ) =====
+    elif data.startswith("bonus_partial_input_"):
+        parts = data.split("_")
+        tariff, months = parts[3], parts[4]
+        months = int(months)
+
+        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+        bonus = user_data[3] if user_data else 0
+
+        if bonus <= 0:
+            await update.effective_chat.send_message(
+                "❌ У вас нет бонусов для частичной оплаты.",
+                reply_markup=back_button()
+            )
+            return
+
+        context.user_data['selected_tariff'] = tariff
+        context.user_data['selected_plan'] = months
+        context.user_data['full_price'] = price
+        context.user_data['awaiting_bonus_input'] = True
+        context.user_data['bonus_tariff'] = tariff
+        context.user_data['bonus_plan'] = months
+        context.user_data['bonus_max'] = min(bonus, price)
+
+        await update.effective_chat.send_message(
+            f"💎 **Частичная оплата бонусами**\n\n"
+            f"💰 Стоимость: **{price} ₽**\n"
+            f"💎 Ваши бонусы: **{bonus} ₽**\n"
+            f"📊 Максимум можно использовать: **{min(bonus, price)} ₽**\n\n"
+            f"✏️ **Введите сумму бонусов, которую хотите потратить:**\n"
+            f"(от 1 до {min(bonus, price)} ₽)",
             parse_mode='Markdown',
             reply_markup=back_button()
         )
 
-    elif data.startswith("pay_plan_"):
+    # ===== ПОЛНАЯ ОПЛАТА КАРТОЙ =====
+    elif data.startswith("pay_full_card_"):
         parts = data.split("_")
-        tariff, months = parts[2], parts[3]
+        tariff, months = parts[3], parts[4]
+        months = int(months)
+
+        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+
+        context.user_data['selected_tariff'] = tariff
+        context.user_data['selected_plan'] = months
+        context.user_data['payment_amount'] = price
+        context.user_data['bonus_to_use'] = 0
+
+        # Создаем платеж через карту
+        payment_data = create_yookassa_payment(
+            user_id=update.effective_user.id,
+            amount=price,
+            description=f"Подписка VPN - {tariff.capitalize()} - {months} мес",
+            payment_type="bank_card"
+        )
+
+        if payment_data:
+            context.user_data['payment_id'] = payment_data['payment_id']
+
+            keyboard = [
+                [InlineKeyboardButton("💳 Перейти к оплате картой", url=payment_data['confirmation_url'])],
+                [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+            ]
+
+            await update.effective_chat.send_message(
+                f"💳 **Оплата банковской картой**\n\n"
+                f"💰 Сумма: **{price} ₽**\n"
+                f"📱 Тариф: {tariff.capitalize()}\n"
+                f"📆 Период: {months} месяц(ев)\n\n"
+                f"🔗 [Оплатить картой]({payment_data['confirmation_url']})",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.effective_chat.send_message(
+                "❌ Ошибка создания платежа. Попробуйте позже.",
+                reply_markup=back_button()
+            )
+
+    # ===== ПОЛНАЯ ОПЛАТА СБП =====
+    elif data.startswith("pay_full_sbp_"):
+        parts = data.split("_")
+        tariff, months = parts[3], parts[4]
+        months = int(months)
+
+        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+
+        context.user_data['selected_tariff'] = tariff
+        context.user_data['selected_plan'] = months
+        context.user_data['payment_amount'] = price
+        context.user_data['bonus_to_use'] = 0
+
+        # Создаем платеж через СБП
+        payment_data = create_yookassa_payment(
+            user_id=update.effective_user.id,
+            amount=price,
+            description=f"Подписка VPN - {tariff.capitalize()} - {months} мес",
+            payment_type="sbp"
+        )
+
+        if payment_data:
+            context.user_data['payment_id'] = payment_data['payment_id']
+
+            keyboard = [
+                [InlineKeyboardButton("🏦 Перейти к оплате через СБП", url=payment_data['confirmation_url'])],
+                [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
+                [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+            ]
+
+            await update.effective_chat.send_message(
+                f"🏦 **Оплата через СБП**\n\n"
+                f"💰 Сумма: **{price} ₽**\n"
+                f"📱 Тариф: {tariff.capitalize()}\n"
+                f"📆 Период: {months} месяц(ев)\n\n"
+                f"🔗 [Оплатить через СБП]({payment_data['confirmation_url']})",
+                parse_mode='Markdown',
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        else:
+            await update.effective_chat.send_message(
+                "❌ Ошибка создания платежа. Попробуйте позже.",
+                reply_markup=back_button()
+            )
+
+    # ===== НАЗАД К ВЫБОРУ СРОКА =====
+    elif data.startswith("back_to_plan_"):
+        tariff = data.split("_")[3]
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+        bonus = user_data[3] if user_data else 0
+
         prices = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}
-        price = prices[tariff][months]
-        context.user_data['selected_plan'] = int(months)
+
+        keyboard = [
+            [InlineKeyboardButton(
+                f"1 месяц — {prices[tariff]['1']} ₽ (бонусов: {min(bonus, prices[tariff]['1'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_1"
+            )],
+            [InlineKeyboardButton(
+                f"3 месяца — {prices[tariff]['3']} ₽ (бонусов: {min(bonus, prices[tariff]['3'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_3"
+            )],
+            [InlineKeyboardButton(
+                f"6 месяцев — {prices[tariff]['6']} ₽ (бонусов: {min(bonus, prices[tariff]['6'])} ₽)",
+                callback_data=f"plan_with_bonus_{tariff}_6"
+            )],
+            [InlineKeyboardButton("🔙 Выбор тарифа", callback_data="payment_tariff_back")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+
         await update.effective_chat.send_message(
-            f"✅ Вы выбрали **{tariff.capitalize()}** на {months} месяц(ев).\n💰 Сумма: {price} ₽\n\nВыберите способ оплаты:",
-            parse_mode='Markdown', reply_markup=payment_method_menu())
+            f"📱 **Тариф {tariff.capitalize()}**\n\n"
+            f"💰 Ваш бонусный счет: **{bonus} ₽**\n\n"
+            f"Выберите срок подписки:",
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-    elif data.startswith("pay_method_"):
-        text, keyboard = payment_processing_menu(data.split("_")[2])
-        await update.effective_chat.send_message(text, parse_mode='Markdown', reply_markup=keyboard)
-
+    # ===== ПРОВЕРКА ПЛАТЕЖА =====
     elif data == "check_payment":
-        await update.effective_chat.send_message(
-            "⏳ Проверяем оплату...\n\nЕсли оплата прошла, подписка будет активирована в течение 5 минут.",
-            reply_markup=back_button())
+        user_id = update.effective_user.id
+        payment_id = context.user_data.get('payment_id')
 
+        if not payment_id:
+            await update.effective_chat.send_message(
+                "❌ Платеж не найден. Попробуйте создать новый.",
+                reply_markup=back_button()
+            )
+            return
+
+        payment_status = check_payment_status(payment_id)
+
+        if payment_status and payment_status['paid'] and payment_status['status'] == 'succeeded':
+            amount = context.user_data.get('payment_amount', 0)
+            bonus_used = context.user_data.get('bonus_to_use', 0)
+            full_price = context.user_data.get('full_price', amount + bonus_used)
+
+            if process_successful_payment(user_id, payment_id, amount):
+                months = context.user_data.get('selected_plan', 1)
+                tariff = context.user_data.get('selected_tariff', 'Simple')
+
+                if bonus_used > 0 and amount > 0:
+                    await update.effective_chat.send_message(
+                        f"✅ **Оплата подтверждена!** 🎉\n\n"
+                        f"📱 Тариф: {tariff.capitalize()}\n"
+                        f"📆 Период: {months} месяц(ев)\n"
+                        f"💰 Полная стоимость: **{full_price} ₽**\n"
+                        f"💎 Оплачено бонусами: **{bonus_used} ₽**\n"
+                        f"💳 Оплачено деньгами: **{amount} ₽**\n"
+                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!\n\n"
+                        f"Теперь вы можете пользоваться VPN без ограничений 🚀",
+                        parse_mode='Markdown',
+                        reply_markup=main_menu()
+                    )
+                elif bonus_used > 0 and amount == 0:
+                    await update.effective_chat.send_message(
+                        f"✅ **Подписка активирована за бонусы!** 🎉\n\n"
+                        f"📱 Тариф: {tariff.capitalize()}\n"
+                        f"📆 Период: {months} месяц(ев)\n"
+                        f"💰 Списано бонусов: **{full_price} ₽**",
+                        parse_mode='Markdown',
+                        reply_markup=main_menu()
+                    )
+                else:
+                    await update.effective_chat.send_message(
+                        f"✅ **Оплата подтверждена!** 🎉\n\n"
+                        f"📱 Тариф: {tariff.capitalize()}\n"
+                        f"📆 Период: {months} месяц(ев)\n"
+                        f"💰 Сумма: **{amount} ₽**\n"
+                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!\n\n"
+                        f"Теперь вы можете пользоваться VPN без ограничений 🚀",
+                        parse_mode='Markdown',
+                        reply_markup=main_menu()
+                    )
+            else:
+                await update.effective_chat.send_message(
+                    "❌ Ошибка активации подписки. Обратитесь в поддержку.",
+                    reply_markup=main_menu()
+                )
+        else:
+            await update.effective_chat.send_message(
+                f"⏳ Платеж еще не оплачен.\n"
+                f"Статус: {payment_status['status'] if payment_status else 'неизвестен'}\n\n"
+                f"Оплатите счет и нажмите «Проверить оплату» снова.",
+                reply_markup=back_button()
+            )
+
+    # ===== ПОДКЛЮЧЕНИЕ =====
     elif data == "connect":
         await update.effective_chat.send_message(
             "🌐 Подключение временно недоступно.\nПожалуйста, оплатите подписку через кнопку «💸 Оплата».",
-            reply_markup=back_button())
+            reply_markup=back_button()
+        )
 
+    # ===== ПРОБНЫЙ ПЕРИОД =====
     elif data == "activate_trial":
         update_user_subscription(update.effective_user.id, 3)
         await send_service_info(update, context)
 
+    # ===== АКТИВАЦИЯ ПРОБНОГО =====
     elif data == "activate":
         await update.effective_chat.send_message(
             "✅ Поздравляем! Вы активировали пробный период на 3 дня.\n\nТеперь вы можете пользоваться нашим VPN без ограничений.\nНаслаждайтесь! 🚀",
-            reply_markup=main_menu())
+            reply_markup=main_menu()
+        )
 
+    # ===== НАШ КАНАЛ =====
     elif data == 'show_channel':
         await update.effective_chat.send_message('Ссылка на канал:\nhttps://t.me/FMH_VPN')
 
+    # ===== ЛИЧНЫЙ КАБИНЕТ =====
     elif data == "profile":
         await send_profile(update, context)
 
+    # ===== РЕФЕРАЛКА =====
     elif data == "referral":
         await referral_start(update, context)
 
+    # ===== ГЛАВНОЕ МЕНЮ =====
     elif data == "main_menu":
         await send_main_menu(update, context)
 
@@ -745,17 +1041,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========== ПОДДЕРЖКА ==========
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📨 Получено сообщение: {update.message.text}")
+    user_id = update.effective_user.id
 
-    # Проверяем, не находимся ли мы в диалоге оплаты
+    # ===== ОБРАБОТКА ВВОДА СУММЫ БОНУСОВ =====
+    if context.user_data.get('awaiting_bonus_input'):
+        try:
+            bonus_amount = int(update.message.text.strip())
+            max_bonus = context.user_data.get('bonus_max', 0)
+            tariff = context.user_data.get('bonus_tariff')
+            months = context.user_data.get('bonus_plan')
+            full_price = context.user_data.get('full_price', 0)
+
+            if bonus_amount <= 0 or bonus_amount > max_bonus:
+                await update.message.reply_text(
+                    f"❌ Введите число от 1 до {max_bonus}",
+                    reply_markup=back_button()
+                )
+                return
+
+            # Сохраняем сумму бонусов
+            context.user_data['bonus_to_use'] = bonus_amount
+            context.user_data['payment_amount'] = full_price - bonus_amount
+            context.user_data['awaiting_bonus_input'] = False
+
+            # Списываем бонусы
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('UPDATE users SET bonus_balance = bonus_balance - %s WHERE user_id = %s',
+                      (bonus_amount, user_id))
+            conn.commit()
+            conn.close()
+
+            remaining = full_price - bonus_amount
+
+            if remaining > 0:
+                # Создаем платеж на остаток
+                payment_data = create_yookassa_payment(
+                    user_id=user_id,
+                    amount=remaining,
+                    description=f"Подписка VPN (остаток) - {tariff.capitalize()} - {months} мес"
+                )
+
+                if payment_data:
+                    context.user_data['payment_id'] = payment_data['payment_id']
+
+                    keyboard = [
+                        [InlineKeyboardButton("💳 Перейти к оплате", url=payment_data['confirmation_url'])],
+                        [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
+                        [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
+                        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+                    ]
+
+                    await update.message.reply_text(
+                        f"✅ **Частичная оплата**\n\n"
+                        f"💰 Полная стоимость: **{full_price} ₽**\n"
+                        f"💎 Списано бонусов: **{bonus_amount} ₽**\n"
+                        f"💳 Остаток к оплате: **{remaining} ₽**\n\n"
+                        f"🔗 [Оплатить остаток]({payment_data['confirmation_url']})",
+                        parse_mode='Markdown',
+                        reply_markup=InlineKeyboardMarkup(keyboard)
+                    )
+                else:
+                    # Возвращаем бонусы при ошибке
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
+                              (bonus_amount, user_id))
+                    conn.commit()
+                    conn.close()
+
+                    await update.message.reply_text(
+                        "❌ Ошибка создания платежа. Бонусы возвращены.",
+                        reply_markup=back_button()
+                    )
+            else:
+                # Остатка нет - активируем подписку
+                conn = get_db_connection()
+                c = conn.cursor()
+                c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s',
+                          (datetime.now() + timedelta(days=30 * months), user_id))
+                conn.commit()
+                conn.close()
+
+                await update.message.reply_text(
+                    f"✅ **Подписка полностью оплачена бонусами!** 🎉\n\n"
+                    f"📱 Тариф: {tariff.capitalize()}\n"
+                    f"📆 Период: {months} месяц(ев)\n"
+                    f"💰 Списано бонусов: **{bonus_amount} ₽**",
+                    parse_mode='Markdown',
+                    reply_markup=main_menu()
+                )
+
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Введите ЧИСЛО. Например: 100",
+                reply_markup=back_button()
+            )
+        return
+
+    # ===== ДИАЛОГ ОПЛАТЫ =====
     if context.user_data.get('state') == PAYMENT_PHONE:
         logger.info("🔴 Сообщение перенаправляется в payment_phone")
         return await payment_phone(update, context)
 
+    # ===== ПОДДЕРЖКА =====
     if context.user_data.get('support_mode'):
         user = update.effective_user
         text = update.message.text
-        await context.bot.send_message(chat_id=ADMIN_CHAT_ID,
-                                       text=f"📩 Новое обращение от {user.first_name} (@{user.username or 'нет username'}):\n\n{text}")
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f"📩 Новое обращение от {user.first_name} (@{user.username or 'нет username'}):\n\n{text}"
+        )
         await update.message.reply_text("✅ Ваше сообщение отправлено в поддержку. Мы ответим вам в ближайшее время.")
         context.user_data['support_mode'] = False
 
@@ -782,7 +1178,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("✅ Бот готов! Теперь ТЫКНИ кнопку в телеграме и смотри что в консоли")
+    logger.info("✅ Бот готов!")
     app.run_polling()
 
 
