@@ -809,6 +809,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "skip_phone":
         return await skip_phone_handler(update, context)
 
+        # ===== ОПЛАТА =====
+    elif data == "payment":
+        return await payment_start(update, context)
+
+
     # ===== НАЗАД К ВЫБОРУ ТАРИФА =====
     elif data == "payment_tariff_back":
         user_id = update.effective_user.id
