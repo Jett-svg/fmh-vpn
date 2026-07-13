@@ -75,7 +75,8 @@ def init_db():
                 phone TEXT,
                 first_time INTEGER DEFAULT 1,
                 referred_by BIGINT DEFAULT NULL,
-                captcha_passed BOOLEAN DEFAULT FALSE
+                captcha_passed BOOLEAN DEFAULT FALSE,
+                bonus_paid BOOLEAN DEFAULT FALSE
             )
         ''')
         conn.commit()
@@ -229,20 +230,33 @@ def check_payment_status(payment_id):
 
 
 def process_payment(user_id, amount):
-    """Обработка оплаты и начисление бонусов рефереру (20%)"""
+    """Обработка оплаты и начисление бонусов рефереру (только за первую оплату)"""
     try:
         conn = get_db_connection()
         c = conn.cursor()
 
+        # 1. Проверяем, есть ли у пользователя реферер
         c.execute('SELECT referred_by FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
 
         if result and result[0]:
             referrer_id = result[0]
-            bonus = int(amount * 0.2)
-            c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
-                      (bonus, referrer_id))
-            logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за платеж {user_id}")
+
+            # 2. Проверяем, не начислялись ли уже бонусы этому пользователю
+            c.execute('SELECT bonus_paid FROM users WHERE user_id = %s', (user_id,))
+            bonus_paid = c.fetchone()[0]
+
+            # 3. Если бонус ещё не начислен — начисляем
+            if not bonus_paid:
+                bonus = int(amount * 0.2)
+                c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
+                          (bonus, referrer_id))
+                # 4. Помечаем, что бонус начислен
+                c.execute('UPDATE users SET bonus_paid = TRUE WHERE user_id = %s', (user_id,))
+                conn.commit()
+                logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за первую оплату {user_id}")
+            else:
+                logger.info(f"ℹ️ Бонусы за {user_id} уже начислены рефереру {referrer_id}")
 
         conn.commit()
         conn.close()
