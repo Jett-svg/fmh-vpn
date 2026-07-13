@@ -69,6 +69,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
                 subscription_end TIMESTAMP,
+                tariff_type TEXT DEFAULT NULL,
                 devices INTEGER DEFAULT 0,
                 max_devices INTEGER DEFAULT 3,
                 bonus_balance INTEGER DEFAULT 0,
@@ -144,28 +145,45 @@ def update_user_phone(user_id, phone):
         return False
 
 
-def update_user_subscription(user_id, days):
+def update_user_subscription(user_id, days, new_tariff):
+    """
+    Обновляет подписку пользователя.
+    - Если тариф совпадает с текущим → продлеваем.
+    - Если тариф отличается → заменяем (сгорает старая подписка).
+    """
     try:
         conn = get_db_connection()
         c = conn.cursor()
 
-        # 1. Проверяем, есть ли активная подписка
-        c.execute('SELECT subscription_end FROM users WHERE user_id = %s', (user_id,))
+        # Получаем текущий тариф и дату окончания
+        c.execute('SELECT tariff_type, subscription_end FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
 
-        # 2. Если подписка активна — продлеваем (добавляем дни)
-        if result and result[0] and result[0] > datetime.now():
-            new_end_date = result[0] + timedelta(days=days)
-            logger.info(f"🔄 Продлеваем подписку: {result[0]} + {days} дней = {new_end_date}")
-        else:
-            # 3. Если нет активной подписки — создаём новую
-            new_end_date = datetime.now() + timedelta(days=days)
-            logger.info(f"🆕 Создаём новую подписку до {new_end_date}")
+        current_tariff = result[0] if result else None
+        current_end = result[1] if result else None
 
-        c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s', (new_end_date, user_id))
+        # Проверяем, активна ли подписка
+        is_active = current_end and current_end > datetime.now()
+
+        if is_active and current_tariff == new_tariff:
+            # 1. ТАРИФ СОВПАДАЕТ → продлеваем
+            new_end_date = current_end + timedelta(days=days)
+            logger.info(f"🔄 Продлеваем {new_tariff}: {current_end} + {days} дней = {new_end_date}")
+        else:
+            # 2. ТАРИФ ОТЛИЧАЕТСЯ ИЛИ ПОДПИСКА НЕАКТИВНА → заменяем
+            new_end_date = datetime.now() + timedelta(days=days)
+            logger.info(f"🆕 Заменяем {current_tariff or 'нет'} на {new_tariff} до {new_end_date}")
+
+        # Обновляем БД
+        c.execute('''
+            UPDATE users 
+            SET subscription_end = %s, tariff_type = %s 
+            WHERE user_id = %s
+        ''', (new_end_date, new_tariff, user_id))
+
         conn.commit()
         conn.close()
-        logger.info(f"✅ Подписка обновлена для {user_id} до {new_end_date}")
+        logger.info(f"✅ Подписка обновлена для {user_id}: тариф={new_tariff}, до={new_end_date}")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка update_user_subscription: {e}")
@@ -279,17 +297,17 @@ def process_payment(user_id, amount):
         return False
 
 
-def process_successful_payment(user_id, payment_id, amount):
+def process_successful_payment(user_id, payment_id, amount, tariff_type):
     """Обработка успешного платежа - активация подписки + бонусы рефереру"""
     try:
-        update_user_subscription(user_id, 30)
+        # 30 дней для любого тарифа
+        update_user_subscription(user_id, 30, tariff_type)
         process_payment(user_id, amount)
         logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка обработки платежа: {e}")
         return False
-
 
 # ========== КНОПКИ ==========
 def main_menu():
@@ -784,7 +802,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== ПОДДЕРЖКА =====
     if data == "help":
         context.user_data['support_mode'] = True
-        await update.effective_chat.send_message("📞 Напишите сообщение поддержке, постараемся ответить оперативно",
+        await update.effective_chat.send_message("📞 Если у вас появились вопросы, напишите нам! Мы ответим вам в ближайщее время. Аккаунт для связи - @FMHHELP",
                                                  reply_markup=back_button())
 
     # ===== ПРОПУСТИТЬ НОМЕР =====
@@ -973,7 +991,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tariff, months = parts[3], parts[4]
         months = int(months)
 
-        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+        price = {"simple": {"1": 249, "3": 599, "6": 999},
+                 "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
 
         context.user_data['selected_tariff'] = tariff
         context.user_data['selected_plan'] = months
@@ -1019,14 +1038,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tariff, months = parts[3], parts[4]
         months = int(months)
 
-        price = {"simple": {"1": 249, "3": 599, "6": 999}, "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
+        price = {"simple": {"1": 249, "3": 599, "6": 999},
+                 "pro": {"1": 499, "3": 1399, "6": 2399}}[tariff][str(months)]
 
         context.user_data['selected_tariff'] = tariff
         context.user_data['selected_plan'] = months
         context.user_data['payment_amount'] = price
         context.user_data['bonus_to_use'] = 0
 
-        # Создаем платеж через СБП
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
@@ -1036,14 +1055,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if payment_data:
             context.user_data['payment_id'] = payment_data['payment_id']
-
             keyboard = [
                 [InlineKeyboardButton("🏦 Перейти к оплате через СБП", url=payment_data['confirmation_url'])],
                 [InlineKeyboardButton("✅ Проверить оплату", callback_data="check_payment")],
                 [InlineKeyboardButton("🔙 Назад", callback_data="payment_tariff_back")],
                 [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
             ]
-
             await update.effective_chat.send_message(
                 f"🏦 **Оплата через СБП**\n\n"
                 f"💰 Сумма: **{price} ₽**\n"
@@ -1097,6 +1114,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "check_payment":
         user_id = update.effective_user.id
         payment_id = context.user_data.get('payment_id')
+        tariff = context.user_data.get('selected_tariff', 'simple')
 
         if not payment_id:
             await update.effective_chat.send_message(
@@ -1112,7 +1130,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bonus_used = context.user_data.get('bonus_to_use', 0)
             full_price = context.user_data.get('full_price', amount + bonus_used)
 
-            if process_successful_payment(user_id, payment_id, amount):
+            if process_successful_payment(user_id, payment_id, amount, tariff):
                 months = context.user_data.get('selected_plan', 1)
                 tariff = context.user_data.get('selected_tariff', 'Simple')
 
