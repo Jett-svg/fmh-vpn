@@ -10,8 +10,13 @@ import threading
 from yookassa import Configuration, Payment
 import uuid
 from dotenv import load_dotenv
-
+import asyncio
+from datetime import datetime, timedelta
+from telegram import Bot
+import random
 load_dotenv()
+
+user_captcha = {}
 
 # ========== НАСТРОЙКА ЛОГИРОВАНИЯ ==========
 logging.basicConfig(
@@ -46,14 +51,8 @@ threading.Thread(target=run_web, daemon=True).start()
 # ========== ПОДКЛЮЧЕНИЕ К POSTGRESQL ==========
 def get_db_connection():
     try:
-        conn = psycopg2.connect(
-            host=os.environ.get('DB_HOST'),
-            database=os.environ.get('DB_NAME'),
-            user=os.environ.get('DB_USER'),
-            password=os.environ.get('DB_PASSWORD'),
-            port=os.environ.get('DB_PORT'),
-            sslmode = 'require'
-        )
+        # Берем готовую строку подключения из переменной окружения DATABASE_URL
+        conn = psycopg2.connect(os.environ.get('DATABASE_URL'))
         logger.info("✅ Подключение к БД успешно")
         return conn
     except Exception as e:
@@ -75,7 +74,9 @@ def init_db():
                 bonus_balance INTEGER DEFAULT 0,
                 phone TEXT,
                 first_time INTEGER DEFAULT 1,
-                referred_by BIGINT DEFAULT NULL
+                referred_by BIGINT DEFAULT NULL,
+                captcha_passed BOOLEAN DEFAULT FALSE,
+                bonus_paid BOOLEAN DEFAULT FALSE
             )
         ''')
         conn.commit()
@@ -160,20 +161,20 @@ def update_user_subscription(user_id, days):
 
 init_db()
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID'))
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '8934659898:AAFjnr0OwI5gV3eV05drid5EnsBrCWGV67c')
+ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
 PAYMENT_PHONE = 1
 
 # ========== НАСТРОЙКА ЮKASSA ==========
-YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID')
-YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY')
+YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID', '1401068')
+YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY', 'test_14IMRPYpmtUV9warhcIWTCwi_WkEOoqYV7_aVvv4njw')
 YOOKASSA_TEST_MODE = True
 
 Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 
-def create_yookassa_payment(user_id, amount, description="Оплата подписки VPN", payment_type="bank_card"):
+def create_yookassa_payment(user_id, amount, description="Оплата подписки на медиа контент", payment_type="bank_card"):
     try:
         idempotence_key = str(uuid.uuid4())
 
@@ -229,20 +230,33 @@ def check_payment_status(payment_id):
 
 
 def process_payment(user_id, amount):
-    """Обработка оплаты и начисление бонусов рефереру (20%)"""
+    """Обработка оплаты и начисление бонусов рефереру (только за первую оплату)"""
     try:
         conn = get_db_connection()
         c = conn.cursor()
 
+        # 1. Проверяем, есть ли у пользователя реферер
         c.execute('SELECT referred_by FROM users WHERE user_id = %s', (user_id,))
         result = c.fetchone()
 
         if result and result[0]:
             referrer_id = result[0]
-            bonus = int(amount * 0.2)
-            c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
-                      (bonus, referrer_id))
-            logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за платеж {user_id}")
+
+            # 2. Проверяем, не начислялись ли уже бонусы этому пользователю
+            c.execute('SELECT bonus_paid FROM users WHERE user_id = %s', (user_id,))
+            bonus_paid = c.fetchone()[0]
+
+            # 3. Если бонус ещё не начислен — начисляем
+            if not bonus_paid:
+                bonus = int(amount * 0.2)
+                c.execute('UPDATE users SET bonus_balance = bonus_balance + %s WHERE user_id = %s',
+                          (bonus, referrer_id))
+                # 4. Помечаем, что бонус начислен
+                c.execute('UPDATE users SET bonus_paid = TRUE WHERE user_id = %s', (user_id,))
+                conn.commit()
+                logger.info(f"💰 Начислено {bonus} бонусов рефереру {referrer_id} за первую оплату {user_id}")
+            else:
+                logger.info(f"ℹ️ Бонусы за {user_id} уже начислены рефереру {referrer_id}")
 
         conn.commit()
         conn.close()
@@ -341,6 +355,39 @@ def payment_tariff_menu_with_bonus(user_id, selected_tariff=None, selected_plan=
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+def mark_captcha_passed(user_id):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET captcha_passed = TRUE WHERE user_id = %s', (user_id,))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ КАПЧА ОТМЕЧЕНА ДЛЯ {user_id}")  # ← ДОБАВЬ ЭТУ СТРОКУ!
+        return True
+    except Exception as e:
+        logger.error(f"❌ Ошибка mark_captcha_passed: {e}")
+        return False
+
+def is_captcha_passed(user_id):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT captcha_passed FROM users WHERE user_id = %s', (user_id,))
+        result = c.fetchone()
+        conn.close()
+        return result and result[0]
+    except Exception as e:
+        logger.error(f"❌ Ошибка is_captcha_passed: {e}")
+        return False
+
+def generate_captcha():
+    a = random.randint(1, 10)
+    b = random.randint(1, 10)
+    if random.choice([True, False]):
+        return f"{a} + {b}", a + b
+    a, b = max(a, b), min(a, b)
+    return f"{a} - {b}", a - b
 
 
 # ========== ОТПРАВКА СООБЩЕНИЙ ==========
@@ -566,7 +613,30 @@ def get_total_earnings(user_id):
 # ========== ОСНОВНЫЕ ОБРАБОТЧИКИ ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    existing_user = get_user(user_id)
 
+    # Если пользователь НОВЫЙ — показываем капчу
+    if existing_user is None:
+        create_user(user_id)
+        question, answer = generate_captcha()
+        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
+        await update.message.reply_text(
+            f"🤖 **Привет! Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
+            parse_mode='HTML'
+        )
+        return
+
+    # Если капча НЕ пройдена — показываем капчу
+    if not is_captcha_passed(user_id):
+        question, answer = generate_captcha()
+        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
+        await update.message.reply_text(
+            f"🤖 **Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
+            parse_mode='HTML'
+        )
+        return
+
+    # ===== ЕСЛИ КАПЧА ПРОЙДЕНА =====
     referrer_id = None
     if context.args:
         try:
@@ -576,42 +646,116 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    existing_user = get_user(user_id)
+    # Сохраняем рефералку (если есть)
+    if referrer_id and referrer_id != user_id:
+        try:
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
+            referrer_data = c.fetchone()
+            if referrer_data and referrer_data[1] and referrer_data[1].strip():
+                c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s', (referrer_id, user_id))
+                conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения реферера: {e}")
 
-    if existing_user is None:
-        create_user(user_id)
-
-        if referrer_id and referrer_id != user_id:
-            try:
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
-                referrer_data = c.fetchone()
-
-                if referrer_data and referrer_data[1] and referrer_data[1].strip():
-                    c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s',
-                              (referrer_id, user_id))
-                    conn.commit()
-                    logger.info(f"✅ Пользователь {user_id} приглашен {referrer_id}")
-                conn.close()
-            except Exception as e:
-                logger.error(f"❌ Ошибка сохранения реферера: {e}")
-
-        user_data = get_user(user_id)
-        if user_data and user_data[5] == 1:
-            mark_user_as_old(user_id)
-            await send_welcome(update, context)
-
+    # НОВЫЙ ПОЛЬЗОВАТЕЛЬ (first_time = 1) — ПОКАЗЫВАЕМ ПРОБНЫЙ ПЕРИОД
+    if existing_user[5] == 1:
+        mark_user_as_old(user_id)
+        await send_welcome(update, context)  # ← ЭТО ПРИВЕТСТВИЕ С ПРОБНЫМ ПЕРИОДОМ
     else:
-        logger.info(f"ℹ️ Пользователь {user_id} уже существует")
+        # СТАРЫЙ ПОЛЬЗОВАТЕЛЬ — ОБЫЧНОЕ ГЛАВНОЕ МЕНЮ
+        await send_main_menu(update, context)
 
-        if existing_user[5] == 1:
-            mark_user_as_old(user_id)
-            await send_welcome(update, context)
-        elif existing_user[0] and existing_user[0] > datetime.now():
-            await send_main_menu(update, context)
+
+async def send_subscription_reminder(bot: Bot, user_id: int, days_left: int, end_date: datetime):
+    """Отправляет напоминание пользователю"""
+    try:
+        # Сообщение для 3 дней
+        if days_left == 3:
+            text = (
+                f"⚠️ **Напоминание!**\n\n"
+                f"Ваша подписка на FMH_VPN закончится через **3 дня**.\n"
+                f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
+                f"💸 Чтобы продлить подписку, нажмите кнопку «💸 Оплата» в меню бота.\n\n"
+                f"Не дайте своему VPN уснуть! 🚀"
+            )
+        # Сообщение для 2 дней
+        elif days_left == 2:
+            text = (
+                f"🔥 **Внимание!**\n\n"
+                f"Ваша подписка на FMH_VPN закончится через **2 дня**!\n"
+                f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
+                f"💸 Продлите подписку сейчас, чтобы не остаться без VPN.\n"
+                f"Нажмите «💸 Оплата» в меню бота."
+            )
+        # Сообщение для 1 дня
+        elif days_left == 1:
+            text = (
+                f"🚨 **Последний день!**\n\n"
+                f"Ваша подписка на FMH_VPN заканчивается **ЗАВТРА**!\n"
+                f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
+                f"💸 **Срочно продлите подписку!**\n"
+                f"Нажмите «💸 Оплата» в меню бота.\n\n"
+                f"Если не продлите, VPN перестанет работать. 😱"
+            )
         else:
-            await send_main_menu(update, context)
+            return
+
+        # Отправляем сообщение (бот может писать пользователю, даже если он не писал ему)
+        await bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
+        logger.info(f"✅ Напоминание ({days_left} дн.) отправлено пользователю {user_id}")
+
+    except Exception as e:
+        # Если пользователь заблокировал бота или его нет
+        logger.error(f"❌ Ошибка отправки напоминания для {user_id}: {e}")
+
+
+async def check_expiring_subscriptions(bot: Bot):
+    """Проверяет подписки и отправляет напоминания за 3, 2 и 1 день до окончания"""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+
+        # Находим пользователей, у которых подписка заканчивается через 1, 2 или 3 дня
+        now = datetime.now()
+
+        c.execute('''
+            SELECT user_id, subscription_end FROM users 
+            WHERE subscription_end IS NOT NULL 
+            AND subscription_end > NOW()
+            AND DATE_PART('day', subscription_end - NOW()) IN (1, 2, 3)
+        ''')
+
+        users = c.fetchall()
+        conn.close()
+
+        for user_id, end_date in users:
+            days_left = (end_date - now).days
+
+            # Отправляем только если осталось 1, 2 или 3 дня
+            if days_left in [1, 2, 3]:
+                await send_subscription_reminder(bot, user_id, days_left, end_date)
+                await asyncio.sleep(0.5)  # Небольшая задержка, чтобы не спамить
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки подписок: {e}")
+
+
+async def scheduled_check(bot: Bot):
+    """Запускает проверку подписок каждый день в 10:00 и 18:00"""
+    while True:
+        try:
+            # Проверяем подписки
+            await check_expiring_subscriptions(bot)
+
+            # Ждем до следующей проверки (12 часов)
+            await asyncio.sleep(12 * 60 * 60)  # 12 часов
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка в scheduled_check: {e}")
+            await asyncio.sleep(60)  # Если ошибка, ждем минуту и пробуем снова
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -824,7 +968,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
-            description=f"Подписка VPN - {tariff.capitalize()} - {months} мес",
+            description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="bank_card"
         )
 
@@ -870,7 +1014,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
-            description=f"Подписка VPN - {tariff.capitalize()} - {months} мес",
+            description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="sbp"
         )
 
@@ -1005,8 +1149,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== ПОДКЛЮЧЕНИЕ =====
     elif data == "connect":
         await update.effective_chat.send_message(
-            "🌐 Подключение временно недоступно.\nПожалуйста, оплатите подписку через кнопку «💸 Оплата».",
-            reply_markup=back_button()
+            "🌐 Подключение временно недоступно.\nПожалуйста, оплатите подписку через кнопку «💸 Оплата».\n\n<a href='https://quaintly-ornate-basil.tilda.ws/'>Ссылка на инструкцию по подключению</a>",
+            reply_markup=back_button(),
+            parse_mode='HTML'
         )
 
     # ===== ПРОБНЫЙ ПЕРИОД =====
@@ -1042,6 +1187,39 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"📨 Получено сообщение: {update.message.text}")
     user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    # ===== ПРОВЕРКА КАПЧИ =====
+    if user_id in user_captcha and 'answer' in user_captcha[user_id]:
+        try:
+            user_answer = int(text)
+            correct_answer = user_captcha[user_id]['answer']
+
+            if user_answer == correct_answer:
+                del user_captcha[user_id]
+                mark_captcha_passed(user_id)
+                await update.message.reply_text("✅ Отлично! Теперь вы можете пользоваться ботом.")
+                # ← ВЫЗЫВАЕМ START, А НЕ send_main_menu!
+                await start(update, context)
+                return
+            else:
+                user_captcha[user_id]['attempts'] += 1
+                if user_captcha[user_id]['attempts'] >= 3:
+                    del user_captcha[user_id]
+                    await update.message.reply_text(
+                        "❌ Вы превысили количество попыток. Напишите /start, чтобы попробовать снова."
+                    )
+                    return
+                question, answer = generate_captcha()
+                user_captcha[user_id] = {'answer': answer, 'attempts': user_captcha[user_id]['attempts']}
+                await update.message.reply_text(
+                    f"❌ Неправильно! Попробуйте ещё раз:\n\n**{question} = ?**\n\nОсталось попыток: {3 - user_captcha[user_id]['attempts']}",
+                    parse_mode='HTML'
+                )
+                return
+        except ValueError:
+            await update.message.reply_text("❌ Введите ЧИСЛО, а не текст.")
+            return
 
     # ===== ОБРАБОТКА ВВОДА СУММЫ БОНУСОВ =====
     if context.user_data.get('awaiting_bonus_input'):
@@ -1079,7 +1257,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 payment_data = create_yookassa_payment(
                     user_id=user_id,
                     amount=remaining,
-                    description=f"Подписка VPN (остаток) - {tariff.capitalize()} - {months} мес"
+                    description=f"Подписка на медиа контент (остаток) - {tariff.capitalize()} - {months} мес"
                 )
 
                 if payment_data:
@@ -1162,6 +1340,10 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Получаем объект бота для отправки сообщений
+    bot = app.bot
+
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
 
     payment_conv = ConversationHandler(
@@ -1177,6 +1359,11 @@ def main():
     app.add_handler(payment_conv)
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Запускаем фоновую задачу для проверки подписок
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(scheduled_check(bot))
 
     logger.info("✅ Бот готов!")
     app.run_polling()
