@@ -1,0 +1,6 @@
+gunicorn
+python-telegram-bot
+psycopg2-binary
+flask
+yookassa
+python-dotenv
