@@ -148,11 +148,24 @@ def update_user_subscription(user_id, days):
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        end_date = datetime.now() + timedelta(days=days)
-        c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s', (end_date, user_id))
+
+        # 1. Проверяем, есть ли активная подписка
+        c.execute('SELECT subscription_end FROM users WHERE user_id = %s', (user_id,))
+        result = c.fetchone()
+
+        # 2. Если подписка активна — продлеваем (добавляем дни)
+        if result and result[0] and result[0] > datetime.now():
+            new_end_date = result[0] + timedelta(days=days)
+            logger.info(f"🔄 Продлеваем подписку: {result[0]} + {days} дней = {new_end_date}")
+        else:
+            # 3. Если нет активной подписки — создаём новую
+            new_end_date = datetime.now() + timedelta(days=days)
+            logger.info(f"🆕 Создаём новую подписку до {new_end_date}")
+
+        c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s', (new_end_date, user_id))
         conn.commit()
         conn.close()
-        logger.info(f"✅ Подписка обновлена для {user_id} на {days} дней до {end_date}")
+        logger.info(f"✅ Подписка обновлена для {user_id} до {new_end_date}")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка update_user_subscription: {e}")
