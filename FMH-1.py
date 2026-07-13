@@ -615,28 +615,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     existing_user = get_user(user_id)
 
-    # Если пользователь НОВЫЙ — показываем капчу
-    if existing_user is None:
-        create_user(user_id)
-        question, answer = generate_captcha()
-        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
-        await update.message.reply_text(
-            f"🤖 **Привет! Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
-            parse_mode='HTML'
-        )
-        return
-
-    # Если капча НЕ пройдена — показываем капчу
-    if not is_captcha_passed(user_id):
-        question, answer = generate_captcha()
-        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
-        await update.message.reply_text(
-            f"🤖 **Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
-            parse_mode='HTML'
-        )
-        return
-
-    # ===== ЕСЛИ КАПЧА ПРОЙДЕНА =====
+    # 1. Сначала обрабатываем реферальную ссылку (если есть)
     referrer_id = None
     if context.args:
         try:
@@ -646,26 +625,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Сохраняем рефералку (если есть)
-    if referrer_id and referrer_id != user_id:
-        try:
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
-            referrer_data = c.fetchone()
-            if referrer_data and referrer_data[1] and referrer_data[1].strip():
-                c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s', (referrer_id, user_id))
-                conn.commit()
-            conn.close()
-        except Exception as e:
-            logger.error(f"❌ Ошибка сохранения реферера: {e}")
+    # 2. Если пользователь НОВЫЙ — создаем и сохраняем реферера
+    if existing_user is None:
+        create_user(user_id)
 
-    # НОВЫЙ ПОЛЬЗОВАТЕЛЬ (first_time = 1) — ПОКАЗЫВАЕМ ПРОБНЫЙ ПЕРИОД
+        # Сохраняем реферера (если есть)
+        if referrer_id and referrer_id != user_id:
+            try:
+                conn = get_db_connection()
+                c = conn.cursor()
+                # Проверяем, что реферер существует
+                c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
+                referrer_data = c.fetchone()
+                if referrer_data and referrer_data[1] and referrer_data[1].strip():
+                    c.execute('UPDATE users SET referred_by = %s WHERE user_id = %s', (referrer_id, user_id))
+                    conn.commit()
+                    logger.info(f"✅ Пользователь {user_id} приглашен {referrer_id}")
+                conn.close()
+            except Exception as e:
+                logger.error(f"❌ Ошибка сохранения реферера: {e}")
+
+        # Показываем капчу новому пользователю
+        question, answer = generate_captcha()
+        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
+        await update.message.reply_text(
+            f"🤖 **Привет! Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
+            parse_mode='HTML'
+        )
+        return
+
+    # 3. Если пользователь уже есть, проверяем капчу
+    if not is_captcha_passed(user_id):
+        question, answer = generate_captcha()
+        user_captcha[user_id] = {'answer': answer, 'attempts': 0}
+        await update.message.reply_text(
+            f"🤖 **Для продолжения решите пример:**\n\n**{question} = ?**\n\nВведите ответ числом.",
+            parse_mode='HTML'
+        )
+        return
+
+    # 4. Если капча пройдена — показываем меню
     if existing_user[5] == 1:
         mark_user_as_old(user_id)
-        await send_welcome(update, context)  # ← ЭТО ПРИВЕТСТВИЕ С ПРОБНЫМ ПЕРИОДОМ
+        await send_welcome(update, context)
     else:
-        # СТАРЫЙ ПОЛЬЗОВАТЕЛЬ — ОБЫЧНОЕ ГЛАВНОЕ МЕНЮ
         await send_main_menu(update, context)
 
 
