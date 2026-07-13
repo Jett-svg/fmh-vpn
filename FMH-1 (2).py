@@ -166,8 +166,8 @@ ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
 PAYMENT_PHONE = 1
 
 # ========== НАСТРОЙКА ЮKASSA ==========
-YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID', '1397847')
-YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY', 'live_XaF3gkYikR9u1vGjtNQ19L6rov0t2Ge6Yn-cHdsDP0s')
+YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID', '1401068')
+YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY', 'test_14IMRPYpmtUV9warhcIWTCwi_WkEOoqYV7_aVvv4njw')
 YOOKASSA_TEST_MODE = True
 
 Configuration.account_id = YOOKASSA_SHOP_ID
