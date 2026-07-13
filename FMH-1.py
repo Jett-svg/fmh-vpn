@@ -145,12 +145,7 @@ def update_user_phone(user_id, phone):
         return False
 
 
-def update_user_subscription(user_id, days, new_tariff):
-    """
-    Обновляет подписку пользователя.
-    - Если тариф совпадает с текущим → продлеваем.
-    - Если тариф отличается → заменяем (сгорает старая подписка).
-    """
+def update_user_subscription(user_id, days, tariff_type=None):
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -165,30 +160,36 @@ def update_user_subscription(user_id, days, new_tariff):
         # Проверяем, активна ли подписка
         is_active = current_end and current_end > datetime.now()
 
-        if is_active and current_tariff == new_tariff:
+        if is_active and current_tariff == tariff_type and tariff_type is not None:
             # 1. ТАРИФ СОВПАДАЕТ → продлеваем
             new_end_date = current_end + timedelta(days=days)
-            logger.info(f"🔄 Продлеваем {new_tariff}: {current_end} + {days} дней = {new_end_date}")
+            logger.info(f"🔄 Продлеваем {tariff_type}: {current_end} + {days} дней = {new_end_date}")
         else:
             # 2. ТАРИФ ОТЛИЧАЕТСЯ ИЛИ ПОДПИСКА НЕАКТИВНА → заменяем
             new_end_date = datetime.now() + timedelta(days=days)
-            logger.info(f"🆕 Заменяем {current_tariff or 'нет'} на {new_tariff} до {new_end_date}")
+            logger.info(f"🆕 Заменяем {current_tariff or 'нет'} на {tariff_type or 'пробный'} до {new_end_date}")
+
+        # Определяем максимальное количество устройств
+        if tariff_type == 'pro':
+            max_devices = 5
+        else:
+            max_devices = 3  # simple или пробный
 
         # Обновляем БД
         c.execute('''
             UPDATE users 
-            SET subscription_end = %s, tariff_type = %s 
+            SET subscription_end = %s, tariff_type = %s, max_devices = %s 
             WHERE user_id = %s
-        ''', (new_end_date, new_tariff, user_id))
+        ''', (new_end_date, tariff_type, max_devices, user_id))
 
         conn.commit()
         conn.close()
-        logger.info(f"✅ Подписка обновлена для {user_id}: тариф={new_tariff}, до={new_end_date}")
+        logger.info(
+            f"✅ Подписка обновлена для {user_id}: тариф={tariff_type}, до={new_end_date}, макс. устройств={max_devices}")
         return True
     except Exception as e:
         logger.error(f"❌ Ошибка update_user_subscription: {e}")
         return False
-
 
 init_db()
 
@@ -298,9 +299,7 @@ def process_payment(user_id, amount):
 
 
 def process_successful_payment(user_id, payment_id, amount, tariff_type):
-    """Обработка успешного платежа - активация подписки + бонусы рефереру"""
     try:
-        # 30 дней для любого тарифа
         update_user_subscription(user_id, 30, tariff_type)
         process_payment(user_id, amount)
         logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}")
@@ -340,6 +339,25 @@ def skip_button():
         [InlineKeyboardButton("⏭️ Пропустить", callback_data="skip_phone")]
     ])
 
+def unknown_choice_text():
+    text = (
+        "❓ **Не знаете, что выбрать?**\n\n"
+        "📱 **Simple** — 249 ₽/месяц\n"
+        "• 3 устройства\n"
+        "• Безлимитный трафик\n"
+        "• Стандартная скорость и резервные серверы\n\n"
+        "🚀 **Pro** — 499 ₽/месяц\n"
+        "• 5 устройств\n"
+        "• Безлимитный трафик\n"
+        "• Максимальная скорость и резервные серверы\n"
+        "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n\n"
+        "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n\n"
+        "• Белые списки (интернет работает всегда, даже когда у других нет)\n\n"
+        "💡 **Совет:** Если вы планируете использовать VPN на нескольких устройствах (телефон, ноутбук, планшет) — выбирайте Pro.\n"
+        "Если только на одном-двух устройствах — Simple вам подойдёт.\n\n"
+        "🔙 Нажмите «Назад», чтобы вернуться к выбору тарифа."
+    )
+    return text
 
 def payment_tariff_menu_with_bonus(user_id, selected_tariff=None, selected_plan=None):
     """Меню тарифов с учетом бонусов и частичной оплаты"""
@@ -381,6 +399,7 @@ def payment_tariff_menu_with_bonus(user_id, selected_tariff=None, selected_plan=
 
     # Если тариф не выбран - показываем выбор тарифа
     keyboard = [
+        [InlineKeyboardButton("❓ Не знаю что выбрать", callback_data="unknown_choice")],
         [InlineKeyboardButton(f"📱 Simple — от 249 ₽ (бонусов: {bonus} ₽)", callback_data="tariff_select_simple")],
         [InlineKeyboardButton(f"🚀 Pro — от 499 ₽ (бонусов: {bonus} ₽)", callback_data="tariff_select_pro")],
         [InlineKeyboardButton("🔙 Назад", callback_data="main_menu")],
@@ -458,6 +477,14 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     subscription_end, devices, max_devices, bonus_balance, phone, _ = user_data
 
+    # Получаем тип тарифа отдельно
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT tariff_type FROM users WHERE user_id = %s', (update.effective_user.id,))
+    result = c.fetchone()
+    tariff_type = result[0] if result else None
+    conn.close()
+
     if subscription_end:
         if isinstance(subscription_end, datetime):
             end_date = subscription_end
@@ -481,10 +508,21 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "❌ Не активна"
         end_text = "нет активной подписки"
 
+    # Определяем название тарифа
+    if tariff_type == 'simple':
+        tariff_name = "📱 Simple (3 устройства)"
+    elif tariff_type == 'pro':
+        tariff_name = "🚀 Pro (5 устройств)"
+    elif tariff_type is None and subscription_end and subscription_end > datetime.now():
+        tariff_name = "📱 Simple (3 устройства)"
+    else:
+        tariff_name = "❌ Нет подписки"
+
     text = (
         f"👤 **Личный кабинет**\n\n"
         f"📅 **Статус подписки:** {status}\n"
-        f"📆 **Окончание:** {end_text}\n\n"
+        f"📆 **Окончание:** {end_text}\n"
+        f"📦 **Тариф:** {tariff_name}\n\n"
         f"📱 **Устройства:** {devices} из {max_devices} использовано\n"
         f"✅ **Свободно:** {max_devices - devices} устройств\n\n"
         f"💰 **Бонусный счёт:** {bonus_balance} ₽\n"
@@ -1193,16 +1231,65 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML'
         )
 
-    # ===== ПРОБНЫЙ ПЕРИОД =====
     elif data == "activate_trial":
-        update_user_subscription(update.effective_user.id, 3)
-        await send_service_info(update, context)
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
 
-    # ===== АКТИВАЦИЯ ПРОБНОГО =====
+        if user_data and user_data[0] and user_data[0] > datetime.now():
+            await update.effective_chat.send_message(
+                "✅ У вас уже есть активная подписка!",
+                reply_markup=main_menu()
+            )
+        else:
+            await send_service_info(update, context)
+
     elif data == "activate":
+        user_id = update.effective_user.id
+        user_data = get_user(user_id)
+
+        if user_data and user_data[0] and user_data[0] > datetime.now():
+            await update.effective_chat.send_message(
+                "✅ У вас уже есть активная подписка!",
+                reply_markup=main_menu()
+            )
+        else:
+            update_user_subscription(user_id, 3, None)  # None = пробный период
+            await update.effective_chat.send_message(
+                "✅ Поздравляем! Вы активировали пробный период на 3 дня.\n\n"
+                "Теперь вы можете пользоваться нашим VPN без ограничений.\n"
+                "Наслаждайтесь! 🚀",
+                reply_markup=main_menu()
+            )
+
+    # ===== НЕ ЗНАЮ ЧТО ВЫБРАТЬ =====
+    elif data == "unknown_choice":
+        text = (
+            "❓ **Не знаете, что выбрать?**\n\n"
+            "📱 **Simple** — 249 ₽/месяц\n"
+            "• 3 устройства\n"
+            "• Безлимитный трафик\n"
+            "• Стандартная скорость и резервные серверы\n\n"
+            "🚀 **Pro** — 499 ₽/месяц\n"
+            "• 5 устройств\n"
+            "• Безлимитный трафик\n"
+            "• Максимальная скорость и резервные серверы\n"
+            "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n\n"
+            "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n\n"
+            "• Белые списки (интернет работает всегда, даже когда у других нет)\n\n"
+            "💡 **Совет:** Если вы планируете использовать VPN на нескольких устройствах (телефон, ноутбук, планшет) — выбирайте Pro.\n"
+            "Если только на одном-двух устройствах — Simple вам подойдёт.\n\n"
+            "🔙 Нажмите «Назад», чтобы вернуться к выбору тарифа."
+        )
+
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад к тарифам", callback_data="payment_tariff_back")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
+        ]
+
         await update.effective_chat.send_message(
-            "✅ Поздравляем! Вы активировали пробный период на 3 дня.\n\nТеперь вы можете пользоваться нашим VPN без ограничений.\nНаслаждайтесь! 🚀",
-            reply_markup=main_menu()
+            text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
     # ===== НАШ КАНАЛ =====
