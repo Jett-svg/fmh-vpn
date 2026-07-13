@@ -77,7 +77,9 @@ def init_db():
                 first_time INTEGER DEFAULT 1,
                 referred_by BIGINT DEFAULT NULL,
                 captcha_passed BOOLEAN DEFAULT FALSE,
-                bonus_paid BOOLEAN DEFAULT FALSE
+                bonus_paid BOOLEAN DEFAULT FALSE,
+                start_date TIMESTAMP DEFAULT NULL,
+                reminder_sent INTEGER DEFAULT 0
             )
         ''')
         conn.commit()
@@ -198,8 +200,8 @@ ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '-5119832795'))
 PAYMENT_PHONE = 1
 
 # ========== НАСТРОЙКА ЮKASSA ==========
-YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID', '1401068')
-YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY', 'test_14IMRPYpmtUV9warhcIWTCwi_WkEOoqYV7_aVvv4njw')
+YOOKASSA_SHOP_ID = os.environ.get('YOOKASSA_SHOP_ID', '1397847')
+YOOKASSA_SECRET_KEY = os.environ.get('YOOKASSA_SECRET_KEY', 'live_XaF3gkYikR9u1vGjtNQ19L6rov0t2Ge6Yn-cHdsDP0s')
 YOOKASSA_TEST_MODE = True
 
 Configuration.account_id = YOOKASSA_SHOP_ID
@@ -350,9 +352,9 @@ def unknown_choice_text():
         "• 5 устройств\n"
         "• Безлимитный трафик\n"
         "• Максимальная скорость и резервные серверы\n"
-        "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n\n"
-        "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n\n"
-        "• Белые списки (интернет работает всегда, даже когда у других нет)\n\n"
+        "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n"
+        "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n"
+        "• Интернет работает всегда, даже когда у других нет)\n\n"
         "💡 **Совет:** Если вы планируете использовать VPN на нескольких устройствах (телефон, ноутбук, планшет) — выбирайте Pro.\n"
         "Если только на одном-двух устройствах — Simple вам подойдёт.\n\n"
         "🔙 Нажмите «Назад», чтобы вернуться к выбору тарифа."
@@ -684,7 +686,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     existing_user = get_user(user_id)
 
-    # 1. Сначала обрабатываем реферальную ссылку (если есть)
+    # ===== ОБРАБОТЫВАЕМ РЕФЕРАЛЬНУЮ ССЫЛКУ (всегда) =====
     referrer_id = None
     if context.args:
         try:
@@ -694,16 +696,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # 2. Если пользователь НОВЫЙ — создаем и сохраняем реферера
+    # ===== НОВЫЙ ПОЛЬЗОВАТЕЛЬ =====
     if existing_user is None:
+        # 1. Создаем пользователя
         create_user(user_id)
 
-        # Сохраняем реферера (если есть)
+        # 2. Сохраняем дату первого запуска
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE users SET start_date = %s WHERE user_id = %s', (datetime.now(), user_id))
+        conn.commit()
+        conn.close()
+
+        # 3. Сохраняем реферера (если есть)
         if referrer_id and referrer_id != user_id:
             try:
                 conn = get_db_connection()
                 c = conn.cursor()
-                # Проверяем, что реферер существует
                 c.execute('SELECT user_id, phone FROM users WHERE user_id = %s', (referrer_id,))
                 referrer_data = c.fetchone()
                 if referrer_data and referrer_data[1] and referrer_data[1].strip():
@@ -714,7 +723,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"❌ Ошибка сохранения реферера: {e}")
 
-        # Показываем капчу новому пользователю
+        # 4. Показываем капчу
         question, answer = generate_captcha()
         user_captcha[user_id] = {'answer': answer, 'attempts': 0}
         await update.message.reply_text(
@@ -723,7 +732,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 3. Если пользователь уже есть, проверяем капчу
+    # ===== СТАРЫЙ ПОЛЬЗОВАТЕЛЬ =====
+    # Если капча НЕ пройдена — показываем капчу
     if not is_captcha_passed(user_id):
         question, answer = generate_captcha()
         user_captcha[user_id] = {'answer': answer, 'attempts': 0}
@@ -733,7 +743,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 4. Если капча пройдена — показываем меню
+    # Если капча пройдена — показываем меню
     if existing_user[5] == 1:
         mark_user_as_old(user_id)
         await send_welcome(update, context)
@@ -741,46 +751,115 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_main_menu(update, context)
 
 
-async def send_subscription_reminder(bot: Bot, user_id: int, days_left: int, end_date: datetime):
-    """Отправляет напоминание пользователю"""
+async def check_inactive_users(bot: Bot):
+    """Проверяет пользователей, которые зарегистрировались, но не активировали пробный период"""
     try:
-        # Сообщение для 3 дней
+        conn = get_db_connection()
+        c = conn.cursor()
+
+        # Находим пользователей, которые:
+        # 1. Зарегистрировались (start_date не NULL)
+        # 2. Не активировали пробный период (subscription_end IS NULL)
+        # 3. Не прошли капчу (captcha_passed = FALSE)
+        # 4. Не получили больше 5 напоминаний
+        c.execute('''
+            SELECT user_id, start_date, reminder_sent 
+            FROM users 
+            WHERE start_date IS NOT NULL 
+            AND subscription_end IS NULL 
+            AND reminder_sent < 5
+        ''')
+
+        users = c.fetchall()
+        conn.close()
+
+        now = datetime.now()
+
+        for user_id, start_date, reminder_sent in users:
+            # Проверяем, сколько дней прошло с первого запуска
+            days_passed = (now - start_date).days
+
+            # Отправляем напоминание только если прошло 0, 1, 2, 3, 4 дня
+            if days_passed == reminder_sent:
+                # Проверяем, не активировал ли пользователь подписку за это время
+                user_data = get_user(user_id)
+                if user_data and user_data[0] is not None:
+                    # Пользователь уже активировал подписку
+                    continue
+
+                text = (
+                    f"👋 **Привет!**\n\n"
+                    f"Вы зарегистрировались в FMH_VPN, но ещё не активировали пробный период.\n\n"
+                    f"🎁 Мы дарим вам **3 дня** бесплатного доступа к VPN.\n"
+                    f"✅ Быстро, надёжно, без ограничений.\n\n"
+                    f"💡 **Чтобы активировать пробный период,** просто нажмите /start и следуйте инструкциям.\n\n"
+                    f"Не упустите возможность попробовать! 🚀"
+                )
+
+                try:
+                    await bot.send_message(chat_id=user_id, text=text, parse_mode='Markdown')
+                    logger.info(f"✅ Напоминание {reminder_sent + 1}/5 отправлено пользователю {user_id}")
+
+                    # Обновляем счетчик напоминаний
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute('UPDATE users SET reminder_sent = reminder_sent + 1 WHERE user_id = %s', (user_id,))
+                    conn.commit()
+                    conn.close()
+
+                    await asyncio.sleep(0.5)  # Задержка, чтобы не спамить
+
+                except Exception as e:
+                    logger.error(f"❌ Ошибка отправки напоминания для {user_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка check_inactive_users: {e}")
+
+
+async def send_subscription_reminder(bot: Bot, user_id: int, days_left: int, end_date: datetime):
+    """Отправляет напоминание пользователю с кнопкой оплаты"""
+    try:
+        # Текст сообщения
         if days_left == 3:
             text = (
                 f"⚠️ **Напоминание!**\n\n"
                 f"Ваша подписка на FMH_VPN закончится через **3 дня**.\n"
                 f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
-                f"💸 Чтобы продлить подписку, нажмите кнопку «💸 Оплата» в меню бота.\n\n"
-                f"Не дайте своему VPN уснуть! 🚀"
+                f"💸 Продлите подписку сейчас, чтобы не остаться без VPN!"
             )
-        # Сообщение для 2 дней
         elif days_left == 2:
             text = (
                 f"🔥 **Внимание!**\n\n"
                 f"Ваша подписка на FMH_VPN закончится через **2 дня**!\n"
                 f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
-                f"💸 Продлите подписку сейчас, чтобы не остаться без VPN.\n"
-                f"Нажмите «💸 Оплата» в меню бота."
+                f"💸 Продлите подписку сейчас, чтобы не остаться без VPN."
             )
-        # Сообщение для 1 дня
         elif days_left == 1:
             text = (
                 f"🚨 **Последний день!**\n\n"
                 f"Ваша подписка на FMH_VPN заканчивается **ЗАВТРА**!\n"
                 f"📅 Дата окончания: {end_date.strftime('%d.%m.%Y')}\n\n"
                 f"💸 **Срочно продлите подписку!**\n"
-                f"Нажмите «💸 Оплата» в меню бота.\n\n"
                 f"Если не продлите, VPN перестанет работать. 😱"
             )
         else:
             return
 
-        # Отправляем сообщение (бот может писать пользователю, даже если он не писал ему)
-        await bot.send_message(chat_id=user_id, text=text, parse_mode='HTML')
-        logger.info(f"✅ Напоминание ({days_left} дн.) отправлено пользователю {user_id}")
+        # Создаем клавиатуру с кнопкой оплаты
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💸 Оплатить", callback_data="payment")]
+        ])
+
+        # Отправляем сообщение с кнопкой
+        await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode='HTML',
+            reply_markup=keyboard
+        )
+        logger.info(f"✅ Напоминание ({days_left} дн.) с кнопкой отправлено пользователю {user_id}")
 
     except Exception as e:
-        # Если пользователь заблокировал бота или его нет
         logger.error(f"❌ Ошибка отправки напоминания для {user_id}: {e}")
 
 
@@ -816,18 +895,25 @@ async def check_expiring_subscriptions(bot: Bot):
 
 
 async def scheduled_check(bot: Bot):
-    """Запускает проверку подписок каждый день в 10:00 и 18:00"""
+    """Запускает проверку подписок каждый день в 10:00 и 18:00, а также неактивных пользователей в 8:00"""
     while True:
         try:
-            # Проверяем подписки
-            await check_expiring_subscriptions(bot)
+            now = datetime.now()
 
-            # Ждем до следующей проверки (12 часов)
-            await asyncio.sleep(12 * 60 * 60)  # 12 часов
+            # Проверка подписок в 10:00 и 18:00
+            if now.hour in [10, 18] and now.minute == 0:
+                await check_expiring_subscriptions(bot)
+
+            # Проверка неактивных пользователей в 8:00
+            if now.hour == 8 and now.minute == 0:
+                await check_inactive_users(bot)
+
+            # Ждем 1 минуту перед следующей проверкой
+            await asyncio.sleep(60)
 
         except Exception as e:
             logger.error(f"❌ Ошибка в scheduled_check: {e}")
-            await asyncio.sleep(60)  # Если ошибка, ждем минуту и пробуем снова
+            await asyncio.sleep(60)
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1273,9 +1359,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 5 устройств\n"
             "• Безлимитный трафик\n"
             "• Максимальная скорость и резервные серверы\n"
-            "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n\n"
-            "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n\n"
-            "• Белые списки (интернет работает всегда, даже когда у других нет)\n\n"
+            "• Возможность не отключать впн когда необходимо зайти в Российские приложения или сайты\n"
+            "• С включенным впн работает навигатор и сотовая связь (нет надоедливого - ОТКЛЮЧИТЕ ВПН)\n"
+            "• Интернет работает всегда, даже когда у других нет)\n\n"
             "💡 **Совет:** Если вы планируете использовать VPN на нескольких устройствах (телефон, ноутбук, планшет) — выбирайте Pro.\n"
             "Если только на одном-двух устройствах — Simple вам подойдёт.\n\n"
             "🔙 Нажмите «Назад», чтобы вернуться к выбору тарифа."
