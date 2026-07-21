@@ -5,7 +5,8 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFi
 import psycopg2
 import os
 from datetime import datetime, timedelta
-from flask import Flask
+from flask import Flask, request, jsonify
+from flask-cors import CORS
 import threading
 from yookassa import Configuration, Payment
 import uuid
@@ -14,6 +15,9 @@ import asyncio
 from datetime import datetime, timedelta
 from telegram import Bot
 import random
+import requests
+import json
+import base64
 load_dotenv()
 
 user_captcha = {}
@@ -85,6 +89,24 @@ def init_db():
         conn.commit()
         conn.close()
         logger.info("✅ Таблица users создана/проверена")
+    except Exception as e:
+        logger.error(f"❌ Ошибка init_db: {e}")
+
+        c.execute('''
+                   CREATE TABLE IF NOT EXISTS payments (
+                       id SERIAL PRIMARY KEY,
+                       user_id BIGINT NOT NULL,
+                       payment_id VARCHAR(255) NOT NULL,
+                       amount INTEGER NOT NULL,
+                       plan VARCHAR(50) NOT NULL,
+                       duration VARCHAR(50) NOT NULL,
+                       status VARCHAR(50) DEFAULT 'pending',
+                       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                   )
+               ''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ Таблица payments создана/проверена")
     except Exception as e:
         logger.error(f"❌ Ошибка init_db: {e}")
 
@@ -309,6 +331,222 @@ def process_successful_payment(user_id, payment_id, amount, tariff_type):
     except Exception as e:
         logger.error(f"❌ Ошибка обработки платежа: {e}")
         return False
+
+
+# ========== НАСТРОЙКА 3X-UI (ДВА СЕРВЕРА) ==========
+
+def get_xui_session(server_type='simple'):
+    """Получает сессию для API 3x-ui в зависимости от типа сервера"""
+    if server_type == 'pro':
+        url = os.environ.get('XUI_URL_PRO')
+        username = os.environ.get('XUI_USERNAME_PRO')
+        password = os.environ.get('XUI_PASSWORD_PRO')
+    else:
+        url = os.environ.get('XUI_URL_SIMPLE')
+        username = os.environ.get('XUI_USERNAME_SIMPLE')
+        password = os.environ.get('XUI_PASSWORD_SIMPLE')
+
+    session = requests.Session()
+    login_data = {
+        "username": username,
+        "password": password
+    }
+    try:
+        response = session.post(f"{url}/login", data=login_data)
+        if response.status_code == 200:
+            logger.info(f"✅ Авторизация в 3x-ui ({server_type}) успешна")
+            return session
+        else:
+            logger.error(f"❌ Ошибка авторизации в 3x-ui ({server_type}): {response.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка подключения к 3x-ui ({server_type}): {e}")
+        return None
+
+
+def create_client_in_3xui(user_id, tariff_type, days):
+    """Создаёт клиента в 3x-ui на нужном сервере с настройками flow"""
+    server_type = 'pro' if tariff_type == 'pro' else 'simple'
+    session = get_xui_session(server_type)
+    if not session:
+        return None
+
+    # Определяем URL и inbound ID
+    if server_type == 'pro':
+        url = os.environ.get('XUI_URL_PRO')
+        inbound_id = int(os.environ.get('XUI_INBOUND_PRO', 1))
+    else:
+        url = os.environ.get('XUI_URL_SIMPLE')
+        inbound_id = int(os.environ.get('XUI_INBOUND_SIMPLE', 1))
+
+    # Генерируем UUID для клиента
+    client_uuid = str(uuid.uuid4())
+    email = f"user_{user_id}_{int(datetime.now().timestamp())}"
+    expiry_time = int((datetime.now() + timedelta(days=days)).timestamp() * 1000)
+
+    # ===== НАСТРОЙКИ ДЛЯ КЛИЕНТА С FLOW =====
+    # Важно: flow настраивается на уровне inbound, но для клиента тоже можно указать
+    client_settings = {
+        "id": client_uuid,
+        "email": email,
+        "expiryTime": expiry_time,
+        "totalGB": 0,
+        "limitIp": 0,
+        "flow": "xtls-rprx-vision"  # Добавляем flow для клиента
+    }
+
+    # Формируем payload для API
+    payload = {
+        "id": inbound_id,
+        "settings": json.dumps({
+            "clients": [client_settings]
+        })
+    }
+
+    try:
+        response = session.post(f"{url}/panel/api/inbounds/addClient", json=payload)
+
+        if response.status_code == 200:
+            logger.info(f"✅ Клиент создан в 3x-ui ({server_type}): {email}")
+            return {
+                'uuid': client_uuid,
+                'email': email,
+                'expiry_time': expiry_time,
+                'server_type': server_type,
+                'flow': 'xtls-rprx-vision'
+            }
+        else:
+            logger.error(f"❌ Ошибка создания клиента ({server_type}): {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания клиента ({server_type}): {e}")
+        return None
+
+
+def get_client_config(user_id, tariff_type):
+    """Получает конфиг клиента из нужного 3x-ui"""
+    server_type = 'pro' if tariff_type == 'pro' else 'simple'
+    session = get_xui_session(server_type)
+    if not session:
+        return None
+
+    if server_type == 'pro':
+        url = os.environ.get('XUI_URL_PRO')
+        inbound_id = int(os.environ.get('XUI_INBOUND_PRO', 1))
+    else:
+        url = os.environ.get('XUI_URL_SIMPLE')
+        inbound_id = int(os.environ.get('XUI_INBOUND_SIMPLE', 1))
+
+    try:
+        response = session.get(f"{url}/panel/api/inbounds/get/{inbound_id}")
+        if response.status_code == 200:
+            data = response.json()
+            clients = data.get('obj', {}).get('settings', {}).get('clients', [])
+
+            email = f"user_{user_id}_"
+            for client in clients:
+                if client.get('email', '').startswith(f"user_{user_id}_"):
+                    return {
+                        'uuid': client.get('id'),
+                        'email': client.get('email'),
+                        'expiry_time': client.get('expiryTime'),
+                        'server_type': server_type,
+                        'flow': client.get('flow', 'xtls-rprx-vision')
+                    }
+        return None
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения конфига ({server_type}): {e}")
+        return None
+
+
+def send_vpn_key_to_user(user_id, client, tariff_type, days):
+    """Отправляет VPN-ключ пользователю в Telegram"""
+    if not client:
+        return
+
+    bot = Bot(token=BOT_TOKEN)
+
+    # Определяем IP сервера и публичный ключ в зависимости от тарифа
+    if tariff_type == 'pro':
+        server_ip = os.environ.get('VPN_SERVER_PRO', '217.60.39.78')
+        public_key = os.environ.get('XUI_PUBLIC_KEY_PRO', '')
+    else:
+        server_ip = os.environ.get('VPN_SERVER_SIMPLE', '95.182.84.148')
+        public_key = os.environ.get('XUI_PUBLIC_KEY_SIMPLE', '')
+
+    # Генерируем ссылку для Incy (VLESS Reality с flow)
+    vless_link = (
+        f"vless://{client['uuid']}@{server_ip}:6767?"
+        f"flow=xtls-rprx-vision&encryption=none&security=reality&"
+        f"sni=cloudflare.com&fp=chrome&pbk={public_key}&"
+        f"type=tcp&headerType=none#FMH_{tariff_type.upper()}"
+    )
+
+    # Определяем название тарифа
+    tariff_name = "🚀 PRO" if tariff_type == 'pro' else "📱 SIMPLE"
+
+    message = f"""
+🎉 **VPN-ключ активирован!**
+
+📋 **Ваш UUID:** `{client['uuid']}`
+
+📧 **Email:** `{client['email']}`
+
+🌐 **Сервер:** `{server_ip}` ({tariff_name})
+
+📦 **Тариф:** {tariff_type.upper()}
+⏰ **Действует:** {days} дней
+🔀 **Flow:** xtls-rprx-vision
+
+🔗 **Ссылка для подключения (Incy/V2RayNG):**
+`{vless_link}`
+
+⚙️ **Инструкция:**
+1. Скачай приложение для VPN (Incy)
+2. Скопируй ссылку выше и вставь в приложение
+3. Подключись и пользуйся! 🚀
+
+💡 Для повторного получения ключа используйте команду /mykey
+"""
+    try:
+        bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
+        logger.info(f"📤 VPN-ключ отправлен пользователю {user_id} ({tariff_type})")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки ключа: {e}")
+
+
+async def mykey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /mykey"""
+    user_id = update.effective_user.id
+
+    user_data = get_user(user_id)
+    if not user_data:
+        await update.message.reply_text("❌ Вы не зарегистрированы. Напишите /start")
+        return
+
+    # Проверяем активность подписки
+    if not user_data[0] or user_data[0] < datetime.now():
+        await update.message.reply_text("❌ У вас нет активной подписки.")
+        return
+
+    # Получаем тариф пользователя
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('SELECT tariff_type FROM users WHERE user_id = %s', (user_id,))
+    result = c.fetchone()
+    conn.close()
+
+    tariff = result[0] if result else 'simple'
+
+    # Получаем конфиг из 3x-ui
+    client = get_client_config(user_id, tariff)
+
+    if client:
+        days_left = (user_data[0] - datetime.now()).days
+        send_vpn_key_to_user(user_id, client, tariff, days_left)
+        await update.message.reply_text("✅ Ваш VPN-ключ отправлен выше!")
+    else:
+        await update.message.reply_text("❌ Не удалось найти ваш ключ. Обратитесь в поддержку.")
 
 # ========== КНОПКИ ==========
 def main_menu():
@@ -1557,6 +1795,9 @@ def main():
 
     # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
+
+    # ===== ДОБАВЛЯЕМ КОМАНДУ /mykey =====
+    app.add_handler(CommandHandler("mykey", mykey_command))
 
     payment_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(payment_start, pattern="^payment$")],
