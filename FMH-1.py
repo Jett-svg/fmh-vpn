@@ -12,12 +12,14 @@ import httpx
 import secrets
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime, timedelta, time
+import time
+from datetime import datetime, timedelta
 from telegram import Bot
 import random
 import requests
 import json
 import base64
+from urllib.parse import urlsplit
 load_dotenv()
 
 user_captcha = {}
@@ -451,26 +453,90 @@ class ThreeXUIClient:
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.password = password
-        self.session = httpx.Client(timeout=15, verify = False)
+        # Origin по стандарту — только схема+хост+порт, без пути (секретного base path панели)
+        _parsed = urlsplit(self.base_url)
+        self.origin = f"{_parsed.scheme}://{_parsed.netloc}"
+        self.csrf_token = None
+        self.session = httpx.Client(
+            timeout=15,
+            verify=False,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+        )
 
     def login(self):
+        # Сначала обычный GET на страницу логина — получаем сессионную cookie,
+        # без неё панель (с включённой защитой CSP/CSRF) отвечает 403 на голый POST.
+        try:
+            r_get = self.session.get(f"{self.base_url}/")
+            r_get.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ 3x-ui GET перед логином не удался [{r_get.status_code}] {self.base_url}: {r_get.text[:500]}")
+            raise
+
+        # Новые версии 3x-ui (3.0.0+) требуют CSRF-токен с отдельного эндпоинта
+        # перед логином, иначе POST /login падает с 403.
+        csrf_token = None
+        try:
+            r_csrf = self.session.get(f"{self.base_url}/csrf-token")
+            if r_csrf.status_code == 200:
+                body = r_csrf.text.strip()
+                try:
+                    data = r_csrf.json()
+                    # токен может лежать под разными ключами в зависимости от версии панели
+                    csrf_token = (
+                        data.get("token") or data.get("csrfToken")
+                        or data.get("obj") or data.get("data")
+                        if isinstance(data, dict) else data
+                    )
+                except ValueError:
+                    csrf_token = body  # ответ пришёл просто как текст, не JSON
+            else:
+                logger.warning(f"⚠️ 3x-ui csrf-token эндпоинт вернул {r_csrf.status_code} — пробуем логин без него")
+        except httpx.HTTPError as e:
+            logger.warning(f"⚠️ Не удалось получить csrf-token у {self.base_url}: {e}")
+
+        login_headers = {
+            # Панель проверяет, что запрос "свой" (Origin/Referer == self)
+            "Origin": self.origin,
+            "Referer": f"{self.base_url}/",
+        }
+        if csrf_token:
+            login_headers["X-Csrf-Token"] = csrf_token
+        self.csrf_token = csrf_token
+
         r = self.session.post(
             f"{self.base_url}/login",
             data={"username": self.username, "password": self.password},
+            headers=login_headers,
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ 3x-ui login failed [{r.status_code}] {self.base_url}: {r.text[:500]}")
+            raise
         # сессия хранится в cookie httpx.Client'а
 
-    def add_client(self, inbound_id: int, client: dict):
+    def add_client(self, inbound_ids: list, client: dict):
+        # В этой версии панели клиент привязывается сразу к нескольким inbound'ам
+        # одним запросом: POST /panel/api/clients/add, body = {"client": {...}, "inboundIds": [...]}
         payload = {
-            "id": inbound_id,
-            "settings": json.dumps({"clients": [client]}),
+            "client": client,
+            "inboundIds": inbound_ids,
         }
         r = self.session.post(
-            f"{self.base_url}/panel/api/inbounds/addClient",
+            f"{self.base_url}/panel/api/clients/add",
             json=payload,
+            headers={"X-Csrf-Token": self.csrf_token} if self.csrf_token else None,
         )
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ 3x-ui clients/add failed [{r.status_code}] {self.base_url} inbounds={inbound_ids}: {r.text[:500]}")
+            raise
         data = r.json()
         if not data.get("success"):
             raise RuntimeError(f"3x-ui error: {data}")
@@ -522,20 +588,26 @@ def issue_subscription(tg_user_id: int, tariff: str, days: int):
     client_payload = {
         "id": client_uuid,
         "email": f"tg{tg_user_id}_{tariff}_{client_uuid[:6]}",
+        "flow": "xtls-rprx-vision",
+        "security": "auto",
         "limitIp": 0,
         "totalGB": 0,
         "expiryTime": expiry_ms,
-        "enable": True,
-        "tgId": str(tg_user_id),
-        "subId": sub_id,
         "reset": 0,
+        "enable": True,
+        "tgId": tg_user_id,
+        "subId": sub_id,
+        "group": "",
+        "comment": "",
+        # uuid/пароль/auth для протокола сервер сгенерирует сам, если не передать —
+        # мы передаём свой id (uuid), чтобы точно знать его для сохранения в БД
     }
 
     for server in SERVERS[tariff]:
         panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
         panel.login()
-        for inbound_id in server["inbound_ids"]:
-            panel.add_client(inbound_id, client_payload)
+        # Новый API привязывает клиента сразу ко всем нужным inbound'ам одним запросом
+        panel.add_client(server["inbound_ids"], client_payload)
 
     # сохраняем в свою БД: tg_user_id, sub_id, uuid, tariff, servers, expiry
     save_subscription_to_db(tg_user_id, sub_id, client_uuid, tariff, expiry_ms)
