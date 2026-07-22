@@ -4,15 +4,15 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, Callb
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 import psycopg2
 import os
-from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
-from flask-cors import CORS
 import threading
 from yookassa import Configuration, Payment
 import uuid
+import httpx
+import secrets
 from dotenv import load_dotenv
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from telegram import Bot
 import random
 import requests
@@ -69,6 +69,7 @@ def init_db():
     try:
         conn = get_db_connection()
         c = conn.cursor()
+
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id BIGINT PRIMARY KEY,
@@ -86,30 +87,89 @@ def init_db():
                 reminder_sent INTEGER DEFAULT 0
             )
         ''')
-        conn.commit()
-        conn.close()
-        logger.info("✅ Таблица users создана/проверена")
-    except Exception as e:
-        logger.error(f"❌ Ошибка init_db: {e}")
 
         c.execute('''
-                   CREATE TABLE IF NOT EXISTS payments (
-                       id SERIAL PRIMARY KEY,
-                       user_id BIGINT NOT NULL,
-                       payment_id VARCHAR(255) NOT NULL,
-                       amount INTEGER NOT NULL,
-                       plan VARCHAR(50) NOT NULL,
-                       duration VARCHAR(50) NOT NULL,
-                       status VARCHAR(50) DEFAULT 'pending',
-                       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                   )
-               ''')
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                payment_id VARCHAR(255) NOT NULL,
+                amount INTEGER NOT NULL,
+                plan VARCHAR(50) NOT NULL,
+                duration VARCHAR(50) NOT NULL,
+                status VARCHAR(50) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                sub_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                client_uuid TEXT NOT NULL,
+                tariff TEXT NOT NULL,
+                expiry_ms BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         conn.commit()
         conn.close()
-        logger.info("✅ Таблица payments создана/проверена")
+        logger.info("✅ Таблицы users/payments/subscriptions созданы/проверены")
     except Exception as e:
         logger.error(f"❌ Ошибка init_db: {e}")
 
+def save_subscription_to_db(user_id, sub_id, client_uuid, tariff, expiry_ms):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                sub_id TEXT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                client_uuid TEXT NOT NULL,
+                tariff TEXT NOT NULL,
+                expiry_ms BIGINT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        c.execute('''
+            INSERT INTO subscriptions (sub_id, user_id, client_uuid, tariff, expiry_ms)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (sub_id) DO UPDATE
+            SET client_uuid = EXCLUDED.client_uuid,
+                tariff = EXCLUDED.tariff,
+                expiry_ms = EXCLUDED.expiry_ms
+        ''', (sub_id, user_id, client_uuid, tariff, expiry_ms))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Подписка {sub_id} сохранена для user_id={user_id}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка save_subscription_to_db: {e}")
+
+
+class SubscriptionRecord:
+    def __init__(self, sub_id, user_id, client_uuid, tariff, expiry_ms):
+        self.sub_id = sub_id
+        self.user_id = user_id
+        self.client_uuid = client_uuid
+        self.tariff = tariff
+        self.expiry_ms = expiry_ms
+
+
+def get_subscription_from_db(sub_id):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT sub_id, user_id, client_uuid, tariff, expiry_ms FROM subscriptions WHERE sub_id = %s',
+                   (sub_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return SubscriptionRecord(*row)
+    except Exception as e:
+        logger.error(f"❌ Ошибка get_subscription_from_db: {e}")
+        return None
 
 def get_user(user_id):
     try:
@@ -230,7 +290,7 @@ Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 
-def create_yookassa_payment(user_id, amount, description="Оплата подписки на медиа контент", payment_type="bank_card"):
+def create_yookassa_payment(user_id, amount, tariff_type, description="Оплата подписки на медиа контент", payment_type="bank_card"):
     try:
         idempotence_key = str(uuid.uuid4())
 
@@ -245,7 +305,8 @@ def create_yookassa_payment(user_id, amount, description="Оплата подп�
             },
             "description": description,
             "metadata": {
-                "user_id": str(user_id)
+                "user_id": str(user_id),
+                "tariff_type": tariff_type
             },
             "capture": True  # ← ДОБАВЬ ЭТУ СТРОКУ! Это включает мгновенное списание
         }
@@ -326,227 +387,183 @@ def process_successful_payment(user_id, payment_id, amount, tariff_type):
     try:
         update_user_subscription(user_id, 30, tariff_type)
         process_payment(user_id, amount)
-        logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}")
-        return True
+
+        sub_link = issue_subscription(user_id, tariff_type, days=30)
+
+        # Отправляем ссылку пользователю в Telegram (асинхронно, но здесь синхронный контекст)
+        # Лучше вызывать через asyncio.create_task, но для простоты можно использовать bot.send_message синхронно
+        # Но проще вернуть ссылку и отправить в обработчике check_payment
+        logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}, ссылка: {sub_link}")
+        return sub_link
     except Exception as e:
         logger.error(f"❌ Ошибка обработки платежа: {e}")
-        return False
-
-
-# ========== НАСТРОЙКА 3X-UI (ДВА СЕРВЕРА) ==========
-
-def get_xui_session(server_type='simple'):
-    """Получает сессию для API 3x-ui в зависимости от типа сервера"""
-    if server_type == 'pro':
-        url = os.environ.get('XUI_URL_PRO')
-        username = os.environ.get('XUI_USERNAME_PRO')
-        password = os.environ.get('XUI_PASSWORD_PRO')
-    else:
-        url = os.environ.get('XUI_URL_SIMPLE')
-        username = os.environ.get('XUI_USERNAME_SIMPLE')
-        password = os.environ.get('XUI_PASSWORD_SIMPLE')
-
-    session = requests.Session()
-    login_data = {
-        "username": username,
-        "password": password
-    }
-    try:
-        response = session.post(f"{url}/login", data=login_data)
-        if response.status_code == 200:
-            logger.info(f"✅ Авторизация в 3x-ui ({server_type}) успешна")
-            return session
-        else:
-            logger.error(f"❌ Ошибка авторизации в 3x-ui ({server_type}): {response.status_code}")
-            return None
-    except Exception as e:
-        logger.error(f"❌ Ошибка подключения к 3x-ui ({server_type}): {e}")
         return None
 
+YOOKASSA_ALLOWED_IPS = {
+    "185.71.76.0/27",
+    "185.71.77.0/27",
+    "77.75.153.0/25",
+    "77.75.156.11",
+    "77.75.156.35",
+    "77.75.154.128/25",
+    "2a02:5180::/32",
+}
+# ⚠️ Проверь актуальный список в доке YooKassa перед продом, они его обновляют
 
-def create_client_in_3xui(user_id, tariff_type, days):
-    """Создаёт клиента в 3x-ui на нужном сервере с настройками flow"""
-    server_type = 'pro' if tariff_type == 'pro' else 'simple'
-    session = get_xui_session(server_type)
-    if not session:
-        return None
+import ipaddress
 
-    # Определяем URL и inbound ID
-    if server_type == 'pro':
-        url = os.environ.get('XUI_URL_PRO')
-        inbound_id = int(os.environ.get('XUI_INBOUND_PRO', 1))
-    else:
-        url = os.environ.get('XUI_URL_SIMPLE')
-        inbound_id = int(os.environ.get('XUI_INBOUND_SIMPLE', 1))
+def is_yookassa_ip(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip)
+    for net in YOOKASSA_ALLOWED_IPS:
+        if addr in ipaddress.ip_network(net):
+            return True
+    return False
 
-    # Генерируем UUID для клиента
+
+@flask_app.route('/yookassa/webhook', methods=['POST'])
+def yookassa_webhook():
+    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    if not is_yookassa_ip(client_ip):
+        logger.warning(f"⚠️ Вебхук с недоверенного IP: {client_ip}")
+        return jsonify({"status": "forbidden"}), 403
+
+    data = request.json
+    if data.get('event') == 'payment.succeeded':
+        obj = data['object']
+        user_id = int(obj['metadata']['user_id'])
+        amount = float(obj['amount']['value'])
+        payment_id = obj['id']
+        tariff_type = obj['metadata'].get('tariff_type', 'simple')
+
+        # доп. защита: сверить статус платежа напрямую в API YooKassa, а не только доверять телу вебхука
+        check = check_payment_status(payment_id)
+        if not check or not check['paid']:
+            logger.warning(f"⚠️ Вебхук для {payment_id} говорит succeeded, но API не подтверждает оплату")
+            return jsonify({"status": "not confirmed"}), 400
+
+        process_successful_payment(user_id, payment_id, amount, tariff_type)
+
+    return jsonify({"status": "ok"}), 200
+
+
+class ThreeXUIClient:
+    def __init__(self, base_url: str, username: str, password: str):
+        self.base_url = base_url.rstrip("/")
+        self.username = username
+        self.password = password
+        self.session = httpx.Client(timeout=15, verify = False)
+
+    def login(self):
+        r = self.session.post(
+            f"{self.base_url}/login",
+            data={"username": self.username, "password": self.password},
+        )
+        r.raise_for_status()
+        # сессия хранится в cookie httpx.Client'а
+
+    def add_client(self, inbound_id: int, client: dict):
+        payload = {
+            "id": inbound_id,
+            "settings": json.dumps({"clients": [client]}),
+        }
+        r = self.session.post(
+            f"{self.base_url}/panel/api/inbounds/addClient",
+            json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(f"3x-ui error: {data}")
+        return data
+
+
+# ========== КОНФИГ VPS-СЕРВЕРОВ (значения из .env, структура — в коде) ==========
+SERVERS = {
+    "simple": [
+        {
+            "panel_url": os.environ['SIMPLE_VPS1_PANEL_URL'],
+            "sub_base_url": os.environ['SIMPLE_VPS1_SUB_URL'],
+            "login": os.environ['SIMPLE_VPS1_LOGIN'],
+            "password": os.environ['SIMPLE_VPS1_PASSWORD'],
+            "inbound_ids": [1, 2],
+        },
+        {
+            "panel_url": os.environ['SIMPLE_VPS2_PANEL_URL'],
+            "sub_base_url": os.environ['SIMPLE_VPS2_SUB_URL'],
+            "login": os.environ['SIMPLE_VPS2_LOGIN'],
+            "password": os.environ['SIMPLE_VPS2_PASSWORD'],
+            "inbound_ids": [1, 2],
+        },
+    ],
+    "pro": [
+        {
+            "panel_url": os.environ['PRO_VPS1_PANEL_URL'],
+            "sub_base_url": os.environ['PRO_VPS1_SUB_URL'],
+            "login": os.environ['PRO_VPS1_LOGIN'],
+            "password": os.environ['PRO_VPS1_PASSWORD'],
+            "inbound_ids": [1, 2],
+        },
+        {
+            "panel_url": os.environ['PRO_VPS2_PANEL_URL'],
+            "sub_base_url": os.environ['PRO_VPS2_SUB_URL'],
+            "login": os.environ['PRO_VPS2_LOGIN'],
+            "password": os.environ['PRO_VPS2_PASSWORD'],
+            "inbound_ids": [1, 2],
+        },
+    ],
+}
+
+
+def issue_subscription(tg_user_id: int, tariff: str, days: int):
     client_uuid = str(uuid.uuid4())
-    email = f"user_{user_id}_{int(datetime.now().timestamp())}"
-    expiry_time = int((datetime.now() + timedelta(days=days)).timestamp() * 1000)
+    sub_id = secrets.token_hex(8)  # общий subId для ВСЕХ инбаундов на ОБОИХ серверах
+    expiry_ms = int((time.time() + days * 86400) * 1000)
 
-    # ===== НАСТРОЙКИ ДЛЯ КЛИЕНТА С FLOW =====
-    # Важно: flow настраивается на уровне inbound, но для клиента тоже можно указать
-    client_settings = {
+    client_payload = {
         "id": client_uuid,
-        "email": email,
-        "expiryTime": expiry_time,
-        "totalGB": 0,
+        "email": f"tg{tg_user_id}_{tariff}_{client_uuid[:6]}",
         "limitIp": 0,
-        "flow": "xtls-rprx-vision"  # Добавляем flow для клиента
+        "totalGB": 0,
+        "expiryTime": expiry_ms,
+        "enable": True,
+        "tgId": str(tg_user_id),
+        "subId": sub_id,
+        "reset": 0,
     }
 
-    # Формируем payload для API
-    payload = {
-        "id": inbound_id,
-        "settings": json.dumps({
-            "clients": [client_settings]
-        })
-    }
+    for server in SERVERS[tariff]:
+        panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
+        panel.login()
+        for inbound_id in server["inbound_ids"]:
+            panel.add_client(inbound_id, client_payload)
 
-    try:
-        response = session.post(f"{url}/panel/api/inbounds/addClient", json=payload)
+    # сохраняем в свою БД: tg_user_id, sub_id, uuid, tariff, servers, expiry
+    save_subscription_to_db(tg_user_id, sub_id, client_uuid, tariff, expiry_ms)
 
-        if response.status_code == 200:
-            logger.info(f"✅ Клиент создан в 3x-ui ({server_type}): {email}")
-            return {
-                'uuid': client_uuid,
-                'email': email,
-                'expiry_time': expiry_time,
-                'server_type': server_type,
-                'flow': 'xtls-rprx-vision'
-            }
-        else:
-            logger.error(f"❌ Ошибка создания клиента ({server_type}): {response.text}")
-            return None
-    except Exception as e:
-        logger.error(f"❌ Ошибка создания клиента ({server_type}): {e}")
-        return None
+    return f"https://sub.yourdomain.com/sub/{sub_id}"
 
 
-def get_client_config(user_id, tariff_type):
-    """Получает конфиг клиента из нужного 3x-ui"""
-    server_type = 'pro' if tariff_type == 'pro' else 'simple'
-    session = get_xui_session(server_type)
-    if not session:
-        return None
+@flask_app.route('/sub/<sub_id>')
+def get_subscription(sub_id):
+    record = get_subscription_from_db(sub_id)
+    if not record:
+        return "Not found", 404
 
-    if server_type == 'pro':
-        url = os.environ.get('XUI_URL_PRO')
-        inbound_id = int(os.environ.get('XUI_INBOUND_PRO', 1))
-    else:
-        url = os.environ.get('XUI_URL_SIMPLE')
-        inbound_id = int(os.environ.get('XUI_INBOUND_SIMPLE', 1))
+    all_lines = []
+    for server in SERVERS[record.tariff]:
+        sub_url = f"{server['sub_base_url']}/fmh1/{sub_id}"
+        try:
+            resp = requests.get(sub_url, timeout=10, verify=False)
+            resp.raise_for_status()
+            decoded = base64.b64decode(resp.text).decode()
+            all_lines.extend(line for line in decoded.splitlines() if line.strip())
+        except Exception as e:
+            logger.error(f"❌ Не удалось получить подписку с {sub_url}: {e}")
 
-    try:
-        response = session.get(f"{url}/panel/api/inbounds/get/{inbound_id}")
-        if response.status_code == 200:
-            data = response.json()
-            clients = data.get('obj', {}).get('settings', {}).get('clients', [])
+    combined = "\n".join(all_lines)
+    encoded = base64.b64encode(combined.encode()).decode()
+    return encoded, 200, {"Content-Type": "text/plain"}
 
-            email = f"user_{user_id}_"
-            for client in clients:
-                if client.get('email', '').startswith(f"user_{user_id}_"):
-                    return {
-                        'uuid': client.get('id'),
-                        'email': client.get('email'),
-                        'expiry_time': client.get('expiryTime'),
-                        'server_type': server_type,
-                        'flow': client.get('flow', 'xtls-rprx-vision')
-                    }
-        return None
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения конфига ({server_type}): {e}")
-        return None
-
-
-def send_vpn_key_to_user(user_id, client, tariff_type, days):
-    """Отправляет VPN-ключ пользователю в Telegram"""
-    if not client:
-        return
-
-    bot = Bot(token=BOT_TOKEN)
-
-    # Определяем IP сервера и публичный ключ в зависимости от тарифа
-    if tariff_type == 'pro':
-        server_ip = os.environ.get('VPN_SERVER_PRO', '217.60.39.78')
-        public_key = os.environ.get('XUI_PUBLIC_KEY_PRO', '')
-    else:
-        server_ip = os.environ.get('VPN_SERVER_SIMPLE', '95.182.84.148')
-        public_key = os.environ.get('XUI_PUBLIC_KEY_SIMPLE', '')
-
-    # Генерируем ссылку для Incy (VLESS Reality с flow)
-    vless_link = (
-        f"vless://{client['uuid']}@{server_ip}:6767?"
-        f"flow=xtls-rprx-vision&encryption=none&security=reality&"
-        f"sni=cloudflare.com&fp=chrome&pbk={public_key}&"
-        f"type=tcp&headerType=none#FMH_{tariff_type.upper()}"
-    )
-
-    # Определяем название тарифа
-    tariff_name = "🚀 PRO" if tariff_type == 'pro' else "📱 SIMPLE"
-
-    message = f"""
-🎉 **VPN-ключ активирован!**
-
-📋 **Ваш UUID:** `{client['uuid']}`
-
-📧 **Email:** `{client['email']}`
-
-🌐 **Сервер:** `{server_ip}` ({tariff_name})
-
-📦 **Тариф:** {tariff_type.upper()}
-⏰ **Действует:** {days} дней
-🔀 **Flow:** xtls-rprx-vision
-
-🔗 **Ссылка для подключения (Incy/V2RayNG):**
-`{vless_link}`
-
-⚙️ **Инструкция:**
-1. Скачай приложение для VPN (Incy)
-2. Скопируй ссылку выше и вставь в приложение
-3. Подключись и пользуйся! 🚀
-
-💡 Для повторного получения ключа используйте команду /mykey
-"""
-    try:
-        bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-        logger.info(f"📤 VPN-ключ отправлен пользователю {user_id} ({tariff_type})")
-    except Exception as e:
-        logger.error(f"❌ Ошибка отправки ключа: {e}")
-
-
-async def mykey_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /mykey"""
-    user_id = update.effective_user.id
-
-    user_data = get_user(user_id)
-    if not user_data:
-        await update.message.reply_text("❌ Вы не зарегистрированы. Напишите /start")
-        return
-
-    # Проверяем активность подписки
-    if not user_data[0] or user_data[0] < datetime.now():
-        await update.message.reply_text("❌ У вас нет активной подписки.")
-        return
-
-    # Получаем тариф пользователя
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('SELECT tariff_type FROM users WHERE user_id = %s', (user_id,))
-    result = c.fetchone()
-    conn.close()
-
-    tariff = result[0] if result else 'simple'
-
-    # Получаем конфиг из 3x-ui
-    client = get_client_config(user_id, tariff)
-
-    if client:
-        days_left = (user_data[0] - datetime.now()).days
-        send_vpn_key_to_user(user_id, client, tariff, days_left)
-        await update.message.reply_text("✅ Ваш VPN-ключ отправлен выше!")
-    else:
-        await update.message.reply_text("❌ Не удалось найти ваш ключ. Обратитесь в поддержку.")
 
 # ========== КНОПКИ ==========
 def main_menu():
@@ -1285,23 +1302,37 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bonus = user_data[3] if user_data else 0
 
         if bonus >= price:
+            # 1. Списываем бонусы
             conn = get_db_connection()
             c = conn.cursor()
-            c.execute('''
-                UPDATE users 
-                SET bonus_balance = bonus_balance - %s, 
-                    subscription_end = %s 
-                WHERE user_id = %s
-            ''', (price, datetime.now() + timedelta(days=30 * months), user_id))
+            c.execute('UPDATE users SET bonus_balance = bonus_balance - %s WHERE user_id = %s', (price, user_id))
             conn.commit()
             conn.close()
 
-            await update.effective_chat.send_message(
+            # 2. Обновляем подписку в БД (тариф, срок, устройства)
+            update_user_subscription(user_id, 30 * months, tariff)
+
+            # 3. Выдаём ключ в 3x-ui и получаем ссылку на подписку
+            try:
+                sub_link = issue_subscription(user_id, tariff, days=30 * months)
+            except Exception as e:
+                logger.error(f"❌ Ошибка выдачи ключа для {user_id}: {e}")
+                sub_link = None
+
+            text = (
                 f"✅ **Подписка активирована за бонусы!** 🎉\n\n"
                 f"📱 Тариф: {tariff.capitalize()}\n"
                 f"📆 Период: {months} месяц(ев)\n"
                 f"💰 Списано бонусов: **{price} ₽**\n"
-                f"📊 Остаток бонусов: **{bonus - price} ₽**",
+                f"📊 Остаток бонусов: **{bonus - price} ₽**"
+            )
+            if sub_link:
+                text += f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`"
+            else:
+                text += "\n\n⚠️ Не удалось выдать ключ автоматически, напишите в поддержку."
+
+            await update.effective_chat.send_message(
+                text,
                 parse_mode='Markdown',
                 reply_markup=main_menu()
             )
@@ -1370,6 +1401,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
+            tariff_type=tariff,
             description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="bank_card"
         )
@@ -1416,6 +1448,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
+            tariff_type=tariff,
             description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="sbp"
         )
@@ -1707,6 +1740,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 payment_data = create_yookassa_payment(
                     user_id=user_id,
                     amount=remaining,
+                    tariff_type=tariff,
                     description=f"Подписка на медиа контент (остаток) - {tariff.capitalize()} - {months} мес"
                 )
 
@@ -1743,19 +1777,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=back_button()
                     )
             else:
-                # Остатка нет - активируем подписку
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute('UPDATE users SET subscription_end = %s WHERE user_id = %s',
-                          (datetime.now() + timedelta(days=30 * months), user_id))
-                conn.commit()
-                conn.close()
+                # Остатка нет - подписка полностью оплачена бонусами
+                update_user_subscription(user_id, 30 * months, tariff)
 
-                await update.message.reply_text(
+                try:
+                    sub_link = issue_subscription(user_id, tariff, days=30 * months)
+                except Exception as e:
+                    logger.error(f"❌ Ошибка выдачи ключа для {user_id}: {e}")
+                    sub_link = None
+
+                text = (
                     f"✅ **Подписка полностью оплачена бонусами!** 🎉\n\n"
                     f"📱 Тариф: {tariff.capitalize()}\n"
                     f"📆 Период: {months} месяц(ев)\n"
-                    f"💰 Списано бонусов: **{bonus_amount} ₽**",
+                    f"💰 Списано бонусов: **{bonus_amount} ₽**"
+                )
+                if sub_link:
+                    text += f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`"
+                else:
+                    text += "\n\n⚠️ Не удалось выдать ключ автоматически, напишите в поддержку."
+
+                await update.message.reply_text(
+                    text,
                     parse_mode='Markdown',
                     reply_markup=main_menu()
                 )
@@ -1796,8 +1839,6 @@ def main():
     # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
 
-    # ===== ДОБАВЛЯЕМ КОМАНДУ /mykey =====
-    app.add_handler(CommandHandler("mykey", mykey_command))
 
     payment_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(payment_start, pattern="^payment$")],
