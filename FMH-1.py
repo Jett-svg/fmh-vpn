@@ -114,56 +114,91 @@ def init_db():
             )
         ''')
 
+        # ===== МИГРАЦИЯ: добавляем недостающие колонки, если таблица уже существует =====
+        c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS email TEXT')
+        c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS client_password TEXT')
+        c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE')
+
         conn.commit()
         conn.close()
         logger.info("✅ Таблицы users/payments/subscriptions созданы/проверены")
     except Exception as e:
         logger.error(f"❌ Ошибка init_db: {e}")
 
-def save_subscription_to_db(user_id, sub_id, client_uuid, tariff, expiry_ms):
-    try:
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                sub_id TEXT PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                client_uuid TEXT NOT NULL,
-                tariff TEXT NOT NULL,
-                expiry_ms BIGINT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        c.execute('''
-            INSERT INTO subscriptions (sub_id, user_id, client_uuid, tariff, expiry_ms)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (sub_id) DO UPDATE
-            SET client_uuid = EXCLUDED.client_uuid,
-                tariff = EXCLUDED.tariff,
-                expiry_ms = EXCLUDED.expiry_ms
-        ''', (sub_id, user_id, client_uuid, tariff, expiry_ms))
-        conn.commit()
-        conn.close()
-        logger.info(f"✅ Подписка {sub_id} сохранена для user_id={user_id}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка save_subscription_to_db: {e}")
 
 
 class SubscriptionRecord:
-    def __init__(self, sub_id, user_id, client_uuid, tariff, expiry_ms):
+    def __init__(self, sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms):
         self.sub_id = sub_id
         self.user_id = user_id
         self.client_uuid = client_uuid
+        self.client_password = client_password
+        self.email = email
         self.tariff = tariff
         self.expiry_ms = expiry_ms
 
 
-def get_subscription_from_db(sub_id):
+def save_subscription_to_db(user_id, sub_id, client_uuid, client_password, email, tariff, expiry_ms):
+    """Сохраняет НОВУЮ активную подписку и гасит все предыдущие активные записи этого пользователя."""
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute('SELECT sub_id, user_id, client_uuid, tariff, expiry_ms FROM subscriptions WHERE sub_id = %s',
-                   (sub_id,))
+
+        # Гасим предыдущие "активные" записи этого пользователя — теперь актуальна только новая
+        c.execute('UPDATE subscriptions SET is_active = FALSE WHERE user_id = %s', (user_id,))
+
+        c.execute('''
+            INSERT INTO subscriptions (sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms, is_active)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+            ON CONFLICT (sub_id) DO UPDATE
+            SET client_uuid = EXCLUDED.client_uuid,
+                client_password = EXCLUDED.client_password,
+                email = EXCLUDED.email,
+                tariff = EXCLUDED.tariff,
+                expiry_ms = EXCLUDED.expiry_ms,
+                is_active = TRUE
+        ''', (sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms))
+
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Подписка {sub_id} сохранена для user_id={user_id} (тариф={tariff})")
+    except Exception as e:
+        logger.error(f"❌ Ошибка save_subscription_to_db: {e}")
+
+
+def update_subscription_expiry_in_db(sub_id, expiry_ms):
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE subscriptions SET expiry_ms = %s WHERE sub_id = %s', (expiry_ms, sub_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"❌ Ошибка update_subscription_expiry_in_db: {e}")
+
+
+def mark_subscription_inactive(sub_id):
+    """Гасит запись, которая рассинхронизирована с реальным состоянием 3x-ui
+    (клиент удалён/не найден на панели), чтобы больше не пытаться её продлевать."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('UPDATE subscriptions SET is_active = FALSE WHERE sub_id = %s', (sub_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"❌ Ошибка mark_subscription_inactive: {e}")
+
+
+def get_subscription_from_db(sub_id):
+    """Используется /sub/<sub_id> — по sub_id, публичный доступ."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms
+            FROM subscriptions WHERE sub_id = %s
+        ''', (sub_id,))
         row = c.fetchone()
         conn.close()
         if not row:
@@ -172,6 +207,29 @@ def get_subscription_from_db(sub_id):
     except Exception as e:
         logger.error(f"❌ Ошибка get_subscription_from_db: {e}")
         return None
+
+
+def get_active_subscription_by_user(user_id):
+    """Используется внутри бота — текущая 'живая' подписка пользователя в 3x-ui."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            SELECT sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms
+            FROM subscriptions
+            WHERE user_id = %s AND is_active = TRUE
+            ORDER BY created_at DESC
+            LIMIT 1
+        ''', (user_id,))
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return SubscriptionRecord(*row)
+    except Exception as e:
+        logger.error(f"❌ Ошибка get_active_subscription_by_user: {e}")
+        return None
+
 
 def get_user(user_id):
     try:
@@ -292,7 +350,7 @@ Configuration.account_id = YOOKASSA_SHOP_ID
 Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 
-def create_yookassa_payment(user_id, amount, tariff_type, description="Оплата подписки на медиа контент", payment_type="bank_card"):
+def create_yookassa_payment(user_id, amount, tariff_type, months, description="Оплата подписки на медиа контент", payment_type="bank_card"):
     try:
         idempotence_key = str(uuid.uuid4())
 
@@ -308,7 +366,8 @@ def create_yookassa_payment(user_id, amount, tariff_type, description="Опла�
             "description": description,
             "metadata": {
                 "user_id": str(user_id),
-                "tariff_type": tariff_type
+                "tariff_type": tariff_type,
+                'months': str(months)
             },
             "capture": True  # ← ДОБАВЬ ЭТУ СТРОКУ! Это включает мгновенное списание
         }
@@ -385,16 +444,10 @@ def process_payment(user_id, amount):
         return False
 
 
-def process_successful_payment(user_id, payment_id, amount, tariff_type):
+def process_successful_payment(user_id, payment_id, amount, tariff_type, months):
     try:
-        update_user_subscription(user_id, 30, tariff_type)
+        sub_link = apply_subscription_payment(user_id, tariff_type, days=30 * months)
         process_payment(user_id, amount)
-
-        sub_link = issue_subscription(user_id, tariff_type, days=30)
-
-        # Отправляем ссылку пользователю в Telegram (асинхронно, но здесь синхронный контекст)
-        # Лучше вызывать через asyncio.create_task, но для простоты можно использовать bot.send_message синхронно
-        # Но проще вернуть ссылку и отправить в обработчике check_payment
         logger.info(f"✅ Платеж {payment_id} обработан для user_id={user_id}, ссылка: {sub_link}")
         return sub_link
     except Exception as e:
@@ -436,16 +489,143 @@ def yookassa_webhook():
         amount = float(obj['amount']['value'])
         payment_id = obj['id']
         tariff_type = obj['metadata'].get('tariff_type', 'simple')
+        months = int(obj['metadata'].get('months', 1))
 
-        # доп. защита: сверить статус платежа напрямую в API YooKassa, а не только доверять телу вебхука
         check = check_payment_status(payment_id)
         if not check or not check['paid']:
-            logger.warning(f"⚠️ Вебхук для {payment_id} говорит succeeded, но API не подтверждает оплату")
             return jsonify({"status": "not confirmed"}), 400
 
-        process_successful_payment(user_id, payment_id, amount, tariff_type)
+        process_successful_payment(user_id, payment_id, amount, tariff_type, months)
 
     return jsonify({"status": "ok"}), 200
+
+def build_subscription_link(tariff: str, sub_id: str) -> str:
+    server = SERVERS[tariff]
+    return f"{server['sub_base_url']}/fmh1/{sub_id}"
+
+
+def build_client_payload(tg_user_id, tariff, client_uuid, client_password, sub_id, expiry_ms):
+    limit_ip = 5 if tariff == "pro" else 3
+    return {
+        "id": client_uuid,
+        "password": client_password,          # используется как auth/пароль для Hysteria/Trojan-инбаунда
+        "email": f"tg{tg_user_id}_{tariff}_{client_uuid[:6]}",
+        "flow": "xtls-rprx-vision",           # актуально только для VLESS-инбаунда, для остальных игнорируется
+        "limitIp": limit_ip,                  # 3 для simple, 5 для pro
+        "totalGB": 0,
+        "expiryTime": expiry_ms,
+        "enable": True,
+        "tgId": tg_user_id,
+        "subId": sub_id,
+        "reset": 0,
+    }
+
+def issue_subscription(tg_user_id: int, tariff: str, expiry_ms: int) -> str:
+    client_uuid = str(uuid.uuid4())
+    client_password = secrets.token_hex(12)
+    sub_id = secrets.token_hex(8)
+
+    client_payload = build_client_payload(tg_user_id, tariff, client_uuid, client_password, sub_id, expiry_ms)
+    email = client_payload["email"]
+
+    server = SERVERS[tariff]
+    panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
+    panel.login()
+    panel.add_client(server["inbound_ids"], client_payload)
+
+    save_subscription_to_db(tg_user_id, sub_id, client_uuid, client_password, email, tariff, expiry_ms)
+    return build_subscription_link(tariff, sub_id)
+
+
+def extend_subscription(record: SubscriptionRecord, new_expiry_ms: int):
+    client_payload = build_client_payload(
+        record.user_id, record.tariff, record.client_uuid, record.client_password,
+        record.sub_id, new_expiry_ms,
+    )
+    server = SERVERS[record.tariff]
+    panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
+    panel.login()
+    panel.update_client(record.email, client_payload)
+
+    update_subscription_expiry_in_db(record.sub_id, new_expiry_ms)
+
+
+def delete_subscription(record: SubscriptionRecord):
+    server = SERVERS[record.tariff]
+    panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
+    panel.login()
+    try:
+        panel.delete_client(record.email)
+    except Exception as e:
+        logger.warning(f"⚠️ Не удалось удалить {record.email} на {server['panel_url']}: {e}")
+
+def apply_subscription_payment(user_id: int, tariff: str, days: int):
+    """
+    Универсальная активация/продление/смена тарифа.
+    - Если у пользователя уже активен ТОТ ЖЕ тариф → продлеваем существующего клиента в 3x-ui (дни суммируются).
+    - Если тариф другой (или подписки не было/истекла) → удаляем старого клиента (если был) и создаём нового.
+    Возвращает ссылку на подписку или None при ошибке.
+    """
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('SELECT tariff_type, subscription_end FROM users WHERE user_id = %s', (user_id,))
+        result = c.fetchone()
+        conn.close()
+
+        current_tariff = result[0] if result else None
+        current_end = result[1] if result else None
+        is_active = current_end and current_end > datetime.now()
+        same_tariff = is_active and current_tariff == tariff and tariff is not None
+
+        new_end_date = (current_end + timedelta(days=days)) if same_tariff else (datetime.now() + timedelta(days=days))
+        max_devices = 5 if tariff == 'pro' else 3
+        expiry_ms = int(new_end_date.timestamp() * 1000)
+
+        # 1. Обновляем данные пользователя (то, что видит бот в личном кабинете)
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute('''
+            UPDATE users 
+            SET subscription_end = %s, tariff_type = %s, max_devices = %s 
+            WHERE user_id = %s
+        ''', (new_end_date, tariff, max_devices, user_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ БД users обновлена: {user_id} → {tariff}, до {new_end_date}")
+
+        # 2. Синхронизируем с 3x-ui
+        if same_tariff:
+            record = get_active_subscription_by_user(user_id)
+            if record and record.tariff == tariff:
+                try:
+                    extend_subscription(record, expiry_ms)
+                    logger.info(f"🔄 Продлён существующий клиент {record.email} до {new_end_date}")
+                    return build_subscription_link(record.tariff, record.sub_id)
+                except Exception as e:
+                    # БД и 3x-ui разошлись (клиент вручную удалён, сбой сети и т.п.) —
+                    # не проваливаем всю оплату, а выпускаем клиента заново
+                    logger.warning(f"⚠️ Не удалось продлить {record.email} в 3x-ui ({e}), пересоздаю клиента")
+                    mark_subscription_inactive(record.sub_id)
+                    return issue_subscription(user_id, tariff, expiry_ms)
+            logger.warning(f"⚠️ Не найдена активная запись subscriptions для {user_id}, создаю новую")
+            return issue_subscription(user_id, tariff, expiry_ms)
+        else:
+            old_record = get_active_subscription_by_user(user_id)
+            if old_record:
+                try:
+                    delete_subscription(old_record)
+                    logger.info(f"🗑️ Удалён клиент старого тарифа {old_record.tariff} для {user_id}")
+                except Exception as e:
+                    # Не смогли удалить старого клиента (например, панель недоступна) —
+                    # всё равно продолжаем выдавать новый, старую запись просто гасим в БД
+                    logger.warning(f"⚠️ Не удалось удалить старого клиента {old_record.email} ({e})")
+                    mark_subscription_inactive(old_record.sub_id)
+            return issue_subscription(user_id, tariff, expiry_ms)
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка apply_subscription_payment: {e}")
+        return None
 
 
 class ThreeXUIClient:
@@ -542,99 +722,55 @@ class ThreeXUIClient:
             raise RuntimeError(f"3x-ui error: {data}")
         return data
 
-
-# ========== КОНФИГ VPS-СЕРВЕРОВ (значения из .env, структура — в коде) ==========
-SERVERS = {
-    "simple": [
-        {
-            "panel_url": os.environ['SIMPLE_VPS1_PANEL_URL'],
-            "sub_base_url": os.environ['SIMPLE_VPS1_SUB_URL'],
-            "login": os.environ['SIMPLE_VPS1_LOGIN'],
-            "password": os.environ['SIMPLE_VPS1_PASSWORD'],
-            "inbound_ids": [1, 2],
-        },
-        {
-            "panel_url": os.environ['SIMPLE_VPS2_PANEL_URL'],
-            "sub_base_url": os.environ['SIMPLE_VPS2_SUB_URL'],
-            "login": os.environ['SIMPLE_VPS2_LOGIN'],
-            "password": os.environ['SIMPLE_VPS2_PASSWORD'],
-            "inbound_ids": [1, 2],
-        },
-    ],
-    "pro": [
-        {
-            "panel_url": os.environ['PRO_VPS1_PANEL_URL'],
-            "sub_base_url": os.environ['PRO_VPS1_SUB_URL'],
-            "login": os.environ['PRO_VPS1_LOGIN'],
-            "password": os.environ['PRO_VPS1_PASSWORD'],
-            "inbound_ids": [1, 2],
-        },
-        {
-            "panel_url": os.environ['PRO_VPS2_PANEL_URL'],
-            "sub_base_url": os.environ['PRO_VPS2_SUB_URL'],
-            "login": os.environ['PRO_VPS2_LOGIN'],
-            "password": os.environ['PRO_VPS2_PASSWORD'],
-            "inbound_ids": [1, 2],
-        },
-    ],
-}
-
-
-def issue_subscription(tg_user_id: int, tariff: str, days: int):
-    client_uuid = str(uuid.uuid4())
-    sub_id = secrets.token_hex(8)  # общий subId для ВСЕХ инбаундов на ОБОИХ серверах
-    expiry_ms = int((time.time() + days * 86400) * 1000)
-
-    client_payload = {
-        "id": client_uuid,
-        "email": f"tg{tg_user_id}_{tariff}_{client_uuid[:6]}",
-        "flow": "xtls-rprx-vision",
-        "security": "auto",
-        "limitIp": 0,
-        "totalGB": 0,
-        "expiryTime": expiry_ms,
-        "reset": 0,
-        "enable": True,
-        "tgId": tg_user_id,
-        "subId": sub_id,
-        "group": "",
-        "comment": "",
-        # uuid/пароль/auth для протокола сервер сгенерирует сам, если не передать —
-        # мы передаём свой id (uuid), чтобы точно знать его для сохранения в БД
-    }
-
-    for server in SERVERS[tariff]:
-        panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
-        panel.login()
-        # Новый API привязывает клиента сразу ко всем нужным inbound'ам одним запросом
-        panel.add_client(server["inbound_ids"], client_payload)
-
-    # сохраняем в свою БД: tg_user_id, sub_id, uuid, tariff, servers, expiry
-    save_subscription_to_db(tg_user_id, sub_id, client_uuid, tariff, expiry_ms)
-
-    return f"https://sub.yourdomain.com/sub/{sub_id}"
-
-
-@flask_app.route('/sub/<sub_id>')
-def get_subscription(sub_id):
-    record = get_subscription_from_db(sub_id)
-    if not record:
-        return "Not found", 404
-
-    all_lines = []
-    for server in SERVERS[record.tariff]:
-        sub_url = f"{server['sub_base_url']}/fmh1/{sub_id}"
+    def update_client(self, email: str, client: dict):
+        r = self.session.post(
+            f"{self.base_url}/panel/api/clients/update/{email}",
+            json=client,
+            headers={"X-Csrf-Token": self.csrf_token} if self.csrf_token else None,
+        )
         try:
-            resp = requests.get(sub_url, timeout=10, verify=False)
-            resp.raise_for_status()
-            decoded = base64.b64decode(resp.text).decode()
-            all_lines.extend(line for line in decoded.splitlines() if line.strip())
-        except Exception as e:
-            logger.error(f"❌ Не удалось получить подписку с {sub_url}: {e}")
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(
+                f"❌ 3x-ui clients/update failed [{r.status_code}] {self.base_url} email={email}: {r.text[:500]}")
+            raise
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(f"3x-ui error: {data}")
+        return data
 
-    combined = "\n".join(all_lines)
-    encoded = base64.b64encode(combined.encode()).decode()
-    return encoded, 200, {"Content-Type": "text/plain"}
+    def delete_client(self, email: str):
+        r = self.session.post(
+            f"{self.base_url}/panel/api/clients/del/{email}",
+            headers={"X-Csrf-Token": self.csrf_token} if self.csrf_token else None,
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"❌ 3x-ui clients/del failed [{r.status_code}] {self.base_url} email={email}: {r.text[:500]}")
+            raise
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(f"3x-ui error: {data}")
+        return data
+
+
+SERVERS = {
+    "simple": {
+        "panel_url": os.environ['SIMPLE_PANEL_URL'],
+        "sub_base_url": os.environ['SIMPLE_SUB_URL'],
+        "login": os.environ['SIMPLE_LOGIN'],
+        "password": os.environ['SIMPLE_PASSWORD'],
+        "inbound_ids": [1, 2, 4, 5],
+    },
+    "pro": {
+        "panel_url": os.environ['PRO_PANEL_URL'],
+        "sub_base_url": os.environ['PRO_SUB_URL'],
+        "login": os.environ['PRO_LOGIN'],
+        "password": os.environ['PRO_PASSWORD'],
+        "inbound_ids": [1, 2, 18, 19],
+    },
+}
 
 
 # ========== КНОПКИ ==========
@@ -847,6 +983,9 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         tariff_name = "❌ Нет подписки"
 
+    record = get_active_subscription_by_user(update.effective_user.id)
+    sub_link_text = f"\n🔑 **Ссылка на подписку:**\n`{build_subscription_link(record.tariff, record.sub_id)}`" if record else ""
+
     text = (
         f"👤 **Личный кабинет**\n\n"
         f"📅 **Статус подписки:** {status}\n"
@@ -856,8 +995,8 @@ async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ **Свободно:** {max_devices - devices} устройств\n\n"
         f"💰 **Бонусный счёт:** {bonus_balance} ₽\n"
         f"📞 **Телефон:** {phone or 'Не указан'}"
+        f"{sub_link_text}"
     )
-
     await update.effective_chat.send_message(text=text, parse_mode='Markdown', reply_markup=back_button())
 
 
@@ -1374,22 +1513,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bonus = user_data[3] if user_data else 0
 
         if bonus >= price:
-            # 1. Списываем бонусы
             conn = get_db_connection()
             c = conn.cursor()
             c.execute('UPDATE users SET bonus_balance = bonus_balance - %s WHERE user_id = %s', (price, user_id))
             conn.commit()
             conn.close()
 
-            # 2. Обновляем подписку в БД (тариф, срок, устройства)
-            update_user_subscription(user_id, 30 * months, tariff)
-
-            # 3. Выдаём ключ в 3x-ui и получаем ссылку на подписку
-            try:
-                sub_link = issue_subscription(user_id, tariff, days=30 * months)
-            except Exception as e:
-                logger.error(f"❌ Ошибка выдачи ключа для {user_id}: {e}")
-                sub_link = None
+            sub_link = apply_subscription_payment(user_id, tariff, days=30 * months)
 
             text = (
                 f"✅ **Подписка активирована за бонусы!** 🎉\n\n"
@@ -1398,23 +1528,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Списано бонусов: **{price} ₽**\n"
                 f"📊 Остаток бонусов: **{bonus - price} ₽**"
             )
-            if sub_link:
-                text += f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`"
-            else:
-                text += "\n\n⚠️ Не удалось выдать ключ автоматически, напишите в поддержку."
+            text += f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`" if sub_link else \
+                "\n\n⚠️ Не удалось выдать ключ автоматически, напишите в поддержку."
 
-            await update.effective_chat.send_message(
-                text,
-                parse_mode='Markdown',
-                reply_markup=main_menu()
-            )
+            await update.effective_chat.send_message(text, parse_mode='Markdown', reply_markup=main_menu())
         else:
             await update.effective_chat.send_message(
-                f"❌ **Недостаточно бонусов!**\n\n"
-                f"💎 У вас: **{bonus}** бонусов\n"
-                f"💸 Нужно: **{price}** бонусов",
-                parse_mode='Markdown',
-                reply_markup=back_button()
+                f"❌ **Недостаточно бонусов!**\n\n💎 У вас: **{bonus}** бонусов\n💸 Нужно: **{price}** бонусов",
+                parse_mode='Markdown', reply_markup=back_button()
             )
 
     # ===== ЧАСТИЧНАЯ ОПЛАТА (ВВОД СУММЫ) =====
@@ -1469,11 +1590,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['payment_amount'] = price
         context.user_data['bonus_to_use'] = 0
 
-        # Создаем платеж через карту
         payment_data = create_yookassa_payment(
             user_id=update.effective_user.id,
             amount=price,
             tariff_type=tariff,
+            months=months,
             description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="bank_card"
         )
@@ -1521,6 +1642,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=update.effective_user.id,
             amount=price,
             tariff_type=tariff,
+            months=months,
             description=f"Подписка на медиа контент - {tariff.capitalize()} - {months} мес",
             payment_type="sbp"
         )
@@ -1587,6 +1709,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         payment_id = context.user_data.get('payment_id')
         tariff = context.user_data.get('selected_tariff', 'simple')
+        months = context.user_data.get('selected_plan', 1)
 
         if not payment_id:
             await update.effective_chat.send_message(
@@ -1602,9 +1725,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bonus_used = context.user_data.get('bonus_to_use', 0)
             full_price = context.user_data.get('full_price', amount + bonus_used)
 
-            if process_successful_payment(user_id, payment_id, amount, tariff):
-                months = context.user_data.get('selected_plan', 1)
-                tariff = context.user_data.get('selected_tariff', 'Simple')
+            sub_link = process_successful_payment(user_id, payment_id, amount, tariff, months)
+
+            if sub_link is not None:
+                link_text = f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`"
 
                 if bonus_used > 0 and amount > 0:
                     await update.effective_chat.send_message(
@@ -1614,17 +1738,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"💰 Полная стоимость: **{full_price} ₽**\n"
                         f"💎 Оплачено бонусами: **{bonus_used} ₽**\n"
                         f"💳 Оплачено деньгами: **{amount} ₽**\n"
-                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!\n\n"
-                        f"Теперь вы можете пользоваться VPN без ограничений 🚀",
-                        parse_mode='Markdown',
-                        reply_markup=main_menu()
-                    )
-                elif bonus_used > 0 and amount == 0:
-                    await update.effective_chat.send_message(
-                        f"✅ **Подписка активирована за бонусы!** 🎉\n\n"
-                        f"📱 Тариф: {tariff.capitalize()}\n"
-                        f"📆 Период: {months} месяц(ев)\n"
-                        f"💰 Списано бонусов: **{full_price} ₽**",
+                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!"
+                        f"{link_text}",
                         parse_mode='Markdown',
                         reply_markup=main_menu()
                     )
@@ -1634,14 +1749,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"📱 Тариф: {tariff.capitalize()}\n"
                         f"📆 Период: {months} месяц(ев)\n"
                         f"💰 Сумма: **{amount} ₽**\n"
-                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!\n\n"
-                        f"Теперь вы можете пользоваться VPN без ограничений 🚀",
+                        f"🎁 Реферер получил **{int(amount * 0.2)}** бонусов!"
+                        f"{link_text}",
                         parse_mode='Markdown',
                         reply_markup=main_menu()
                     )
             else:
                 await update.effective_chat.send_message(
-                    "❌ Ошибка активации подписки. Обратитесь в поддержку.",
+                    "⚠️ Оплата прошла, но возникла ошибка выдачи ключа. Напишите в поддержку — мы выдадим ключ вручную.",
                     reply_markup=main_menu()
                 )
         else:
@@ -1654,11 +1769,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ПОДКЛЮЧЕНИЕ =====
     elif data == "connect":
-        await update.effective_chat.send_message(
-            "🌐 Подключение временно недоступно.\nПожалуйста, оплатите подписку через кнопку «💸 Оплата».\n\n<a href='https://quaintly-ornate-basil.tilda.ws/'>Ссылка на инструкцию по подключению</a>",
-            reply_markup=back_button(),
-            parse_mode='HTML'
-        )
+        record = get_active_subscription_by_user(update.effective_user.id)
+        if record:
+            text = (
+                f"🌐 **Ваша ссылка на подписку:**\n`{build_subscription_link(record.tariff, record.sub_id)}`\n\n"
+                f"<a href='https://quaintly-ornate-basil.tilda.ws/'>Инструкция по подключению</a>"
+            )
+        else:
+            text = (
+                "🌐 У вас пока нет активной подписки.\n"
+                "Оформите её через кнопку «💸 Оплата».\n\n"
+                "<a href='https://quaintly-ornate-basil.tilda.ws/'>Ссылка на инструкцию по подключению</a>"
+            )
+        await update.effective_chat.send_message(text, reply_markup=back_button(), parse_mode='HTML')
 
     elif data == "activate_trial":
         user_id = update.effective_user.id
@@ -1808,11 +1931,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             remaining = full_price - bonus_amount
 
             if remaining > 0:
-                # Создаем платеж на остаток
                 payment_data = create_yookassa_payment(
                     user_id=user_id,
                     amount=remaining,
                     tariff_type=tariff,
+                    months=months,
                     description=f"Подписка на медиа контент (остаток) - {tariff.capitalize()} - {months} мес"
                 )
 
@@ -1850,30 +1973,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             else:
                 # Остатка нет - подписка полностью оплачена бонусами
-                update_user_subscription(user_id, 30 * months, tariff)
-
-                try:
-                    sub_link = issue_subscription(user_id, tariff, days=30 * months)
-                except Exception as e:
-                    logger.error(f"❌ Ошибка выдачи ключа для {user_id}: {e}")
-                    sub_link = None
+                sub_link = apply_subscription_payment(user_id, tariff, days=30 * months)
 
                 text = (
-                    f"✅ **Подписка полностью оплачена бонусами!** 🎉\n\n"
-                    f"📱 Тариф: {tariff.capitalize()}\n"
-                    f"📆 Период: {months} месяц(ев)\n"
-                    f"💰 Списано бонусов: **{bonus_amount} ₽**"
+                     f"✅ **Подписка полностью оплачена бонусами!** 🎉\n\n"
+                     f"📱 Тариф: {tariff.capitalize()}\n"
+                     f"📆 Период: {months} месяц(ев)\n"
+                     f"💰 Списано бонусов: **{bonus_amount} ₽**"
                 )
                 if sub_link:
                     text += f"\n\n🔑 **Ваша ссылка на подписку:**\n`{sub_link}`"
                 else:
                     text += "\n\n⚠️ Не удалось выдать ключ автоматически, напишите в поддержку."
 
-                await update.message.reply_text(
-                    text,
-                    parse_mode='Markdown',
-                    reply_markup=main_menu()
-                )
+                await update.message.reply_text(text, parse_mode='Markdown', reply_markup=main_menu())
 
         except ValueError:
             await update.message.reply_text(
