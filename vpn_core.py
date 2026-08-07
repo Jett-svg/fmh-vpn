@@ -3,72 +3,137 @@
 и интеграция с панелями 3x-ui. Раньше этот код был продублирован в bot.py
 и app.py по отдельности — из-за этого версии расходились и чинить баги
 приходилось в двух местах. Теперь это единственный источник правды.
+
+MySQL 8.0: подключение к БД переиспользует SQLAlchemy engine из database.py
+(mysql+pymysql), а не создаёт своё собственное — так у бота и сайта гарантированно
+одинаковые настройки пула/таймаутов и один и тот же connection string.
 """
 
-import os
+import json
 import logging
+import os
 import secrets
+import traceback
 import uuid
 from datetime import datetime, timedelta
 from urllib.parse import urlsplit
 
 import httpx
-import psycopg2
+import pymysql
 from dotenv import load_dotenv
+
+from database import engine
 
 logger = logging.getLogger(__name__)
 load_dotenv()
 
+
 # ========== ПОДКЛЮЧЕНИЕ К БД ==========
 def get_db_connection():
-    return psycopg2.connect(os.environ['DATABASE_URL'])
+    """
+    Возвращает "сырое" DBAPI-соединение (pymysql) из пула, настроенного
+    в database.py (pool_pre_ping, pool_recycle, connect_timeout=10 и т.д.).
+    По API (.cursor(), .commit(), .close()) полностью взаимозаменяемо
+    с тем, что раньше возвращал psycopg2.connect(...).
+    """
+    return engine.raw_connection()
 
 
 # ========== СХЕМА (идемпотентно, можно звать из обоих сервисов при старте) ==========
+def _safe_execute(cursor, sql, ignore_errno=None, label=""):
+    """
+    Выполняет DDL и молча игнорирует ошибку "уже существует" (используется
+    для ALTER TABLE ADD COLUMN / CREATE INDEX, у которых в MySQL 8.0 не всегда
+    можно надёжно использовать IF NOT EXISTS).
+    ignore_errno: код ошибки MySQL, который считаем нормальным (объект уже есть).
+      1060 = Duplicate column name
+      1061 = Duplicate key name
+    """
+    try:
+        cursor.execute(sql)
+    except pymysql.err.InternalError as e:
+        errno = e.args[0] if e.args else None
+        if ignore_errno and errno == ignore_errno:
+            logger.info(f"ℹ️ Пропущено (уже существует): {label}")
+        else:
+            raise
+    except pymysql.err.OperationalError as e:
+        errno = e.args[0] if e.args else None
+        if ignore_errno and errno == ignore_errno:
+            logger.info(f"ℹ️ Пропущено (уже существует): {label}")
+        else:
+            raise
+
+
 def init_shared_schema():
     conn = get_db_connection()
     c = conn.cursor()
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            subscription_end TIMESTAMP,
-            tariff_type TEXT DEFAULT NULL,
-            devices INTEGER DEFAULT 0,
-            max_devices INTEGER DEFAULT 3,
-            bonus_balance INTEGER DEFAULT 0,
-            phone TEXT,
-            first_time INTEGER DEFAULT 1,
+            user_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+            subscription_end DATETIME DEFAULT NULL,
+            tariff_type VARCHAR(50) DEFAULT NULL,
+            devices INT DEFAULT 0,
+            max_devices INT DEFAULT 3,
+            bonus_balance INT DEFAULT 0,
+            phone VARCHAR(32) DEFAULT NULL,
+            first_time INT DEFAULT 1,
             referred_by BIGINT DEFAULT NULL,
             captcha_passed BOOLEAN DEFAULT FALSE,
             bonus_paid BOOLEAN DEFAULT FALSE,
-            start_date TIMESTAMP DEFAULT NULL,
-            reminder_sent INTEGER DEFAULT 0
-        )
+            start_date DATETIME DEFAULT NULL,
+            reminder_sent INT DEFAULT 0,
+            email VARCHAR(255) DEFAULT NULL,
+            password_hash VARCHAR(255) DEFAULT NULL,
+            email_verified BOOLEAN DEFAULT FALSE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY users_email_unique (email),
+            UNIQUE KEY users_phone_unique (phone)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ''')
+
+    # Пользователи сайта получают ID из очень большого диапазона, чтобы никогда
+    # не пересечься с настоящими Telegram ID (у Postgres для этого была
+    # отдельная убывающая SEQUENCE — в MySQL аналога нет, поэтому используем
+    # обычный AUTO_INCREMENT, но стартующий с гигантского числа).
+    # Выполняется один раз — если счётчик уже сдвинут выше, ALTER TABLE его не понизит.
+    # ВАЖНО: значение должно быть намного больше любого реального Telegram ID
+    # (сейчас они уже доходят до нескольких миллиардов) и согласовано с проверкой
+    # `tg_user_id < 1_000_000_000_000` в build_client_payload() — иначе сайтовый
+    # ID может случайно совпасть с чьим-то настоящим Telegram ID.
+    try:
+        c.execute('ALTER TABLE users AUTO_INCREMENT = 9000000000000')
+    except (pymysql.err.InternalError, pymysql.err.OperationalError) as e:
+        logger.warning(f"⚠️ Не удалось выставить AUTO_INCREMENT для users: {e}")
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS payments (
-            id SERIAL PRIMARY KEY,
+            id INT PRIMARY KEY AUTO_INCREMENT,
             user_id BIGINT NOT NULL,
             payment_id VARCHAR(255) NOT NULL,
-            amount INTEGER NOT NULL,
+            amount INT NOT NULL,
             plan VARCHAR(50) NOT NULL,
             duration VARCHAR(50) NOT NULL,
             status VARCHAR(50) DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY payments_payment_id_uidx (payment_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ''')
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
-            sub_id TEXT PRIMARY KEY,
+            sub_id VARCHAR(255) PRIMARY KEY,
             user_id BIGINT NOT NULL,
-            client_uuid TEXT NOT NULL,
-            tariff TEXT NOT NULL,
+            client_uuid VARCHAR(255) NOT NULL,
+            tariff VARCHAR(50) NOT NULL,
             expiry_ms BIGINT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+            email VARCHAR(255) DEFAULT NULL,
+            client_password VARCHAR(255) DEFAULT NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX subscriptions_user_id_idx (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ''')
 
     c.execute('''
@@ -76,37 +141,34 @@ def init_shared_schema():
             token VARCHAR(255) PRIMARY KEY,
             telegram_user_id BIGINT,
             used BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ''')
 
-    c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS email TEXT')
-    c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS client_password TEXT')
-    c.execute('ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE')
-    c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT')
-    c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT')
-    c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT FALSE')
-
-    c.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS users_email_unique_idx
-        ON users (email) WHERE email IS NOT NULL AND email <> ''
-    ''')
-    c.execute('''
-        CREATE UNIQUE INDEX IF NOT EXISTS users_phone_unique_idx
-        ON users (phone) WHERE phone IS NOT NULL AND phone <> ''
-    ''')
-    c.execute('CREATE UNIQUE INDEX IF NOT EXISTS payments_payment_id_uidx ON payments(payment_id)')
-
-    c.execute('''
-        CREATE SEQUENCE IF NOT EXISTS site_user_id_seq
-        MINVALUE -9223372036854775000
-        INCREMENT -1
-        START -1
-    ''')
+    # На случай апгрейда с более старой версии таблицы (без этих колонок/индексов) —
+    # добавляем недостающее и молча пропускаем, если уже есть.
+    _safe_execute(c, 'ALTER TABLE subscriptions ADD COLUMN email VARCHAR(255) DEFAULT NULL',
+                  ignore_errno=1060, label="subscriptions.email")
+    _safe_execute(c, 'ALTER TABLE subscriptions ADD COLUMN client_password VARCHAR(255) DEFAULT NULL',
+                  ignore_errno=1060, label="subscriptions.client_password")
+    _safe_execute(c, 'ALTER TABLE subscriptions ADD COLUMN is_active BOOLEAN DEFAULT TRUE',
+                  ignore_errno=1060, label="subscriptions.is_active")
+    _safe_execute(c, 'ALTER TABLE users ADD COLUMN email VARCHAR(255) DEFAULT NULL',
+                  ignore_errno=1060, label="users.email")
+    _safe_execute(c, 'ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) DEFAULT NULL',
+                  ignore_errno=1060, label="users.password_hash")
+    _safe_execute(c, 'ALTER TABLE users ADD COLUMN email_verified BOOLEAN DEFAULT FALSE',
+                  ignore_errno=1060, label="users.email_verified")
+    _safe_execute(c, 'CREATE UNIQUE INDEX users_email_unique ON users(email)',
+                  ignore_errno=1061, label="users_email_unique")
+    _safe_execute(c, 'CREATE UNIQUE INDEX users_phone_unique ON users(phone)',
+                  ignore_errno=1061, label="users_phone_unique")
+    _safe_execute(c, 'CREATE UNIQUE INDEX payments_payment_id_uidx ON payments(payment_id)',
+                  ignore_errno=1061, label="payments_payment_id_uidx")
 
     conn.commit()
     conn.close()
-    logger.info("✅ Общая схема БД проверена/создана (vpn_core)")
+    logger.info("✅ Общая схема БД проверена/создана (vpn_core, MySQL)")
 
 
 # ========== СЕРВЕРА 3x-ui ==========
@@ -116,14 +178,14 @@ SERVERS = {
         "sub_base_url": os.environ['SIMPLE_SUB_URL'],
         "login": os.environ['SIMPLE_LOGIN'],
         "password": os.environ['SIMPLE_PASSWORD'],
-        "inbound_ids": [1, 2, 4, 5],
+        "inbound_ids": [6, 7, 8, 9, 20, 21],
     },
     "pro": {
         "panel_url": os.environ['PRO_PANEL_URL'],
         "sub_base_url": os.environ['PRO_SUB_URL'],
         "login": os.environ['PRO_LOGIN'],
         "password": os.environ['PRO_PASSWORD'],
-        "inbound_ids": [1, 2, 18, 19],
+        "inbound_ids": [1, 2, 18, 19, 20, 21],
     },
 }
 
@@ -135,10 +197,10 @@ def build_subscription_link(tariff: str, sub_id: str) -> str:
 
 def build_client_payload(tg_user_id, tariff, client_uuid, client_password, sub_id, expiry_ms):
     limit_ip = 5 if tariff == "pro" else 3
-    # tg_user_id отрицателен для пользователей, зарегистрированных через сайт
-    # (см. site_user_id_seq) — это не настоящий Telegram chat ID, панели он не нужен
-    # в таком виде, передаём 0, чтобы не ломать встроенные уведомления 3x-ui.
-    panel_tg_id = tg_user_id if tg_user_id > 0 else 0
+    # tg_user_id для пользователей, зарегистрированных через сайт, — это огромное
+    # AUTO_INCREMENT-число (см. init_shared_schema), а не настоящий Telegram chat ID.
+    # Панели такой ID не нужен, передаём 0, чтобы не ломать встроенные уведомления 3x-ui.
+    panel_tg_id = tg_user_id if tg_user_id < 1_000_000_000_000 else 0
     return {
         "id": client_uuid,
         "password": client_password,          # auth/пароль для Hysteria/Trojan-инбаунда
@@ -267,6 +329,59 @@ class ThreeXUIClient:
             raise RuntimeError(f"3x-ui error: {data}")
         return data
 
+    def get_client_ips(self, email: str) -> list:
+        """
+        Возвращает список УНИКАЛЬНЫХ IP-адресов, с которых подключался клиент
+        (журнал IP, который панель также использует для контроля limitIp).
+        Именно из этого можно получить настоящее "количество устройств".
+
+        ВАЖНО: правильный путь для 3x-ui (Clients-раздел) —
+        POST /panel/api/clients/ips/{email}, а НЕ /panel/api/inbounds/clientIps/{email}
+        (последнего на этой панели просто нет — отсюда были 404).
+
+        Формат ответа: {"success": true, "obj": ["1.2.3.4 (2026-07-29 12:00:00)", ...]}
+        — то есть каждая запись это "IP (таймстамп подключения)", а не голый IP,
+        и один и тот же IP может встречаться несколько раз (по одной записи на
+        каждое подключение). Поэтому обязательно дедуплицируем сам IP.
+        """
+        r = self.session.post(
+            f"{self.base_url}/panel/api/clients/ips/{email}",
+            headers={"X-Csrf-Token": self.csrf_token} if self.csrf_token else None,
+        )
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"❌ 3x-ui clients/ips failed [{r.status_code}] {self.base_url} email={email}: {r.text[:500]}")
+            raise
+        data = r.json()
+        if not data.get("success"):
+            raise RuntimeError(f"3x-ui error: {data}")
+
+        obj = data.get("obj")
+        if not obj or obj == "No IP Record":
+            return []
+
+        # На случай если где-то отдаётся JSON-строкой, а не массивом
+        if isinstance(obj, str):
+            try:
+                obj = json.loads(obj)
+            except (ValueError, TypeError):
+                return []
+
+        if not isinstance(obj, list):
+            return []
+
+        unique_ips = set()
+        for entry in obj:
+            if not isinstance(entry, str):
+                continue
+            # "1.2.3.4 (2026-07-29 12:00:00)" → берём часть до первого пробела
+            ip = entry.split(" ")[0].strip()
+            if ip:
+                unique_ips.add(ip)
+
+        return list(unique_ips)
+
 
 # ========== ЗАПИСЬ ПОДПИСКИ ==========
 class SubscriptionRecord:
@@ -287,12 +402,12 @@ def save_subscription_to_db(user_id, sub_id, client_uuid, client_password, email
     c.execute('''
         INSERT INTO subscriptions (sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms, is_active)
         VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-        ON CONFLICT (sub_id) DO UPDATE
-        SET client_uuid = EXCLUDED.client_uuid,
-            client_password = EXCLUDED.client_password,
-            email = EXCLUDED.email,
-            tariff = EXCLUDED.tariff,
-            expiry_ms = EXCLUDED.expiry_ms,
+        ON DUPLICATE KEY UPDATE
+            client_uuid = VALUES(client_uuid),
+            client_password = VALUES(client_password),
+            email = VALUES(email),
+            tariff = VALUES(tariff),
+            expiry_ms = VALUES(expiry_ms),
             is_active = TRUE
     ''', (sub_id, user_id, client_uuid, client_password, email, tariff, expiry_ms))
     conn.commit()
@@ -341,6 +456,44 @@ def get_active_subscription_by_user(user_id):
     row = c.fetchone()
     conn.close()
     return SubscriptionRecord(*row) if row else None
+
+
+# ========== РЕАЛЬНОЕ КОЛИЧЕСТВО УСТРОЙСТВ ==========
+def get_devices_used(record: "SubscriptionRecord") -> int:
+    """
+    Спрашивает у панели 3x-ui, с скольких разных IP реально подключался
+    клиент — это и есть "количество подключённых устройств".
+
+    ВАЖНО: это живой сетевой запрос к панели на каждый вызов (как и остальные
+    функции в этом файле — login() перед каждым действием). Если панель
+    недоступна или отвечает с ошибкой, исключение пробрасывается наверх —
+    вызывающий код (например, /api/user в api.py) должен сам решить,
+    что показать пользователю при сбое (например, последнее известное
+    значение из БД вместо падения запроса целиком).
+    """
+    server = SERVERS[record.tariff]
+    panel = ThreeXUIClient(server["panel_url"], server["login"], server["password"])
+    panel.login()
+    ips = panel.get_client_ips(record.email)
+    return len(ips)
+
+
+def sync_devices_used_to_db(user_id: int, record: "SubscriptionRecord") -> int:
+    """
+    То же самое, что get_devices_used(), но дополнительно сохраняет
+    результат в users.devices — чтобы у этого числа было "последнее
+    известное" значение на случай, если панель временно недоступна.
+    Возвращает актуальное количество устройств.
+    """
+    devices_used = get_devices_used(record)
+
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute('UPDATE users SET devices = %s WHERE user_id = %s', (devices_used, user_id))
+    conn.commit()
+    conn.close()
+
+    return devices_used
 
 
 # ========== ВЫДАЧА / ПРОДЛЕНИЕ / УДАЛЕНИЕ КЛИЕНТА В 3x-ui ==========
@@ -443,7 +596,7 @@ def apply_subscription_payment(user_id: int, tariff: str, days: int):
         c = conn.cursor()
         c.execute('''
             UPDATE users
-            SET subscription_end = %s, tariff_type = %s, max_devices = %s
+            SET subscription_end = %s, tariff_type = %s, max_devices = %s, devices = 0
             WHERE user_id = %s
         ''', (new_end_date, tariff, max_devices, user_id))
         conn.commit()
@@ -453,20 +606,36 @@ def apply_subscription_payment(user_id: int, tariff: str, days: int):
         return sub_link
 
     except Exception as e:
-        logger.error(f"❌ Ошибка apply_subscription_payment: {e}")
+        error_msg = f"❌ Ошибка apply_subscription_payment: {e}\n{traceback.format_exc()}"
+        logger.error(error_msg)
+
+        # Опционально дублируем ошибку в отдельный файл — только если путь задан
+        # явно через .env (APP_LOG_PATH). Так один и тот же vpn_core.py безопасно
+        # работает и на сервере сайта, и на сервере бота: если переменная не задана
+        # (или указанной директории не существует), просто ничего не пишем в файл,
+        # вместо падения с FileNotFoundError.
+        app_log_path = os.environ.get('APP_LOG_PATH')
+        if app_log_path:
+            try:
+                with open(app_log_path, "a") as f:
+                    f.write(f"[{datetime.now().isoformat()}] {error_msg}\n")
+            except OSError as log_err:
+                logger.warning(f"⚠️ Не удалось записать в APP_LOG_PATH={app_log_path}: {log_err}")
+
         return None
 
 
 # ========== ИДЕМПОТЕНТНАЯ ОБРАБОТКА ПЛАТЕЖЕЙ ==========
 def mark_payment_processed_if_new(payment_id, user_id, amount, tariff, months) -> bool:
     """True только для ПЕРВОГО успешного вызова с этим payment_id — защищает от двойного
-    продления, если платёж будет обработан дважды (вебхук + опрос статуса с фронта/бота)."""
+    продления, если платёж будет обработан дважды (вебхук + опрос статуса с фронта/бота).
+    В MySQL нет ON CONFLICT ... DO NOTHING — аналог: INSERT IGNORE, а факт "была ли
+    вставка" смотрим по cursor.rowcount (0 — проигнорировано, 1 — вставлено)."""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute('''
-        INSERT INTO payments (user_id, payment_id, amount, plan, duration, status)
+        INSERT IGNORE INTO payments (user_id, payment_id, amount, plan, duration, status)
         VALUES (%s, %s, %s, %s, %s, 'succeeded')
-        ON CONFLICT (payment_id) DO NOTHING
     ''', (user_id, payment_id, int(amount), tariff, str(months)))
     conn.commit()
     is_first_time = c.rowcount == 1
