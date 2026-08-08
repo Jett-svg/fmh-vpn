@@ -1,6 +1,8 @@
-gunicorn
 python-telegram-bot
-psycopg2-binary
-flask
+Flask
 yookassa
 python-dotenv
+httpx
+PyMySQL
+SQLAlchemy
+cryptography
